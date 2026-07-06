@@ -1,7 +1,8 @@
 import tempfile
 import unittest
+from queue import Queue
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
@@ -23,10 +24,29 @@ from pictochat_encode import (
     write_pcap,
 )
 from pictochat_live import EXPECTED_CHUNKS, LAST_CHUNK_OFFSET
-from pictochat_send import linux_monitor_commands
+from pictochat_send import InjectionWorker, linux_monitor_commands
 
 
 class EncoderTests(unittest.TestCase):
+    def test_linux_injection_socket_does_not_pass_capture_only_monitor_option(self):
+        radio_socket = MagicMock()
+        scapy_conf = MagicMock()
+        scapy_conf.L2socket.return_value = radio_socket
+        radio_tap = MagicMock()
+        radio_tap.return_value.__truediv__.return_value = object()
+        fake_scapy = MagicMock(RadioTap=radio_tap, Raw=MagicMock(), conf=scapy_conf)
+        worker = InjectionWorker(Queue(), "wlan0", [b"frame"], 1, 0)
+
+        with (
+            patch.dict("sys.modules", {"scapy": MagicMock(), "scapy.all": fake_scapy}),
+            patch("pictochat_send.sys.platform", "linux"),
+        ):
+            worker.run()
+
+        scapy_conf.L2socket.assert_called_once_with(iface="wlan0")
+        radio_socket.send.assert_called_once()
+        radio_socket.close.assert_called_once()
+
     def test_linux_monitor_setup_uses_argument_lists(self):
         paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw"}
         with patch("pictochat_send.shutil.which", side_effect=paths.get):

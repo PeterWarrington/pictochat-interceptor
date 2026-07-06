@@ -102,10 +102,11 @@ class InjectionWorker(threading.Thread):
             # Opening and writing the L2 socket ourselves lets us identify the
             # exact frame whose BPF/driver write failed. sendp() otherwise
             # collapses the whole batch into one fairly opaque exception.
-            socket_options: dict[str, object] = {"iface": self.interface}
-            if sys.platform.startswith("linux"):
-                socket_options["monitor"] = True
-            radio_socket = conf.L2socket(**socket_options)
+            # Linux's native Scapy L2Socket does not accept the ``monitor``
+            # keyword (it is supported by some capture socket backends).  The
+            # interface has already been put into monitor mode with iw above,
+            # so passing only its name works on Linux as well as macOS/BPF.
+            radio_socket = conf.L2socket(iface=self.interface)
             for repetition in range(self.repetitions):
                 for frame_index, packet in enumerate(packets):
                     written = radio_socket.send(packet)
