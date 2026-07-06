@@ -62,6 +62,19 @@ def resource_path(filename: str) -> Path:
 
 def available_interfaces() -> list[str]:
     """Return interface names without requiring Scapy to be installed."""
+    # Windows' socket interface names are not always the names understood by
+    # Npcap.  Scapy normalises Npcap's GUIDs and friendly names for us.
+    if sys.platform == "win32":
+        try:
+            from scapy.all import get_if_list
+
+            interfaces = [name for name in get_if_list() if name]
+            if interfaces:
+                return interfaces
+        # Scapy raises its own exception type when Npcap is absent or broken.
+        # Falling back keeps saved-dump viewing usable without Npcap.
+        except Exception:
+            pass
     try:
         return [name for _, name in socket.if_nameindex()]
     except OSError:
@@ -247,6 +260,23 @@ class CaptureWorker(threading.Thread):
             self.output.put(("stopped", None))
             return
 
+        if sys.platform == "win32":
+            try:
+                self._run_windows_capture()
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    self.output.put(
+                        (
+                            "error",
+                            "Windows capture could not start. Install Npcap with raw 802.11 "
+                            "and monitor-mode support enabled, then run the app as Administrator. "
+                            f"Details: {exc}",
+                        )
+                    )
+            finally:
+                self.output.put(("stopped", None))
+            return
+
         if sys.platform.startswith("linux") and self.configure_linux:
             try:
                 self._configure_linux_monitor()
@@ -328,6 +358,38 @@ class CaptureWorker(threading.Thread):
                 except subprocess.TimeoutExpired:
                     process.kill()
             self.output.put(("stopped", None))
+
+    def _run_windows_capture(self) -> None:
+        """Capture through Scapy's Npcap socket instead of Unix tcpdump."""
+        from scapy.all import conf, sniff
+
+        # Scapy uses Npcap/libpcap for monitor-mode capture on Windows.  Open
+        # the socket synchronously so missing Npcap, bad interfaces, and
+        # permission failures are reported back to the GUI.
+        conf.use_pcap = True
+        socket_options: dict[str, object] = {
+            "iface": self.interface,
+            "monitor": True,
+        }
+        if self.capture_filter.strip():
+            socket_options["filter"] = self.capture_filter.strip()
+        capture_socket = conf.L2listen(**socket_options)
+        try:
+            self.output.put(
+                (
+                    "info",
+                    "Listening through Npcap; set the Wi-Fi adapter to the PictoChat channel.",
+                )
+            )
+            while not self.stop_event.is_set():
+                sniff(
+                    opened_socket=capture_socket,
+                    store=False,
+                    timeout=0.25,
+                    prn=lambda packet: self.output.put(("packet", list(bytes(packet)))),
+                )
+        finally:
+            capture_socket.close()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -544,7 +606,13 @@ class PictoChatLiveApp:
 
         tk.Label(controls, text="2.4 GHz channel", bg=PANEL, fg=MUTED,
                  font=("TkDefaultFont", u.font(9))).pack(anchor="w")
-        channel_values = [str(channel) for channel in range(1, 14)] + ["Current"]
+        channel_values = (
+            ["Current"]
+            if sys.platform == "win32"
+            else [str(channel) for channel in range(1, 14)] + ["Current"]
+        )
+        if sys.platform == "win32":
+            self.channel_var.set("Current")
         self.channel_box = ttk.Combobox(controls, textvariable=self.channel_var,
                                         values=channel_values, state="readonly")
         self.channel_box.pack(fill="x", pady=(u.px(5), u.px(12)))

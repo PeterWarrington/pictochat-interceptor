@@ -451,6 +451,15 @@ class InjectionWorker(threading.Thread):
                     "CAP_NET_RAW to open the injection socket. Running as root supplies both.",
                 )
             )
+        elif sys.platform == "win32":
+            lines.extend(
+                (
+                    "",
+                    "Windows raw capture and injection require Npcap with raw 802.11 and "
+                    "monitor-mode support, an adapter/driver that supports injection, and "
+                    "usually an Administrator session.",
+                )
+            )
         return "\n".join(lines)
 
 def resource_path(filename: str) -> Path:
@@ -601,6 +610,9 @@ class PictoChatSendApp:
         if sys.platform.startswith("linux"):
             note = ("Use the MAC of a DS already joined to the room. Linux auto-setup needs "
                     "CAP_NET_ADMIN/CAP_NET_RAW and leaves the adapter in monitor mode.")
+        elif sys.platform == "win32":
+            note = ("Use the MAC of a DS already joined to the room. Windows requires Npcap "
+                    "and a Wi-Fi adapter/driver with raw 802.11 monitor and injection support.")
         else:
             note = ("Use the MAC of a DS already joined to the room. Requires an injection-capable "
                     "monitor adapter; built-in macOS Wi-Fi normally cannot inject.")
@@ -739,6 +751,11 @@ class PictoChatSendApp:
             warning += (
                 f"\n\n{self.interface_var.get()} will be taken down, changed to monitor mode, "
                 f"and tuned to channel {self.channel_var.get()}."
+            )
+        elif sys.platform == "win32":
+            warning += (
+                "\n\nWindows requires Npcap and an adapter already configured for raw "
+                "802.11 monitor mode on the selected channel."
             )
         if not messagebox.askokcancel("Experimental transmission", warning, icon="warning"):
             return

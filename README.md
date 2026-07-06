@@ -81,6 +81,22 @@ python -m pip install -r requirements.txt
 .venv/bin/python pictochat_live.py
 ```
 
+On Windows, install a current 64-bit Python with Tcl/Tk, then use PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python pictochat_live.py
+```
+
+Live capture on Windows uses Npcap directly through Scapy instead of `tcpdump`.
+Install Npcap with its raw 802.11/monitor-mode option enabled and run the viewer
+as Administrator. The Wi-Fi adapter and its Windows driver must support monitor
+mode, and the adapter must already be tuned to the PictoChat channel; the Windows
+UI therefore labels the channel as **Current**. Opening saved hex dumps, decoding,
+image import/export, and PCAP export do not require Npcap or administrator access.
+
 On macOS, keep the viewer running as your normal account. When you begin a
 fixed-channel capture it opens the standard administrator authentication dialog
 for the brief CoreWLAN channel switch only. The GUI is never relaunched as root,
