@@ -27,22 +27,26 @@ PNG export, packet-capture export, and an experimental raw 802.11 sender:
 .venv/bin/python pictochat_send.py
 ```
 
-The encoder is the exact inverse of the existing decoder: it creates the
-row-major 4bpp Nintendo tiles, retains the four-byte message prefix, and emits
-all 65 chunks needed to carry every pixel. **Export packets as PCAP** works on
-any platform and is the best way to inspect the result before transmitting.
+The encoder creates the row-major 4bpp Nintendo tiles and emits the 64 client
+upload chunks observed on the air (offsets `0x00a0` through `0x2800`). **Export
+packets as PCAP** works on any platform and is the best way to inspect the
+result before transmitting. The local encoder can still construct a 65th tail
+chunk for lossless codec tests, but that `0x28a0` chunk is not sent by a DS.
 
 Over-the-air sending requires an injection-capable Wi-Fi adapter in monitor
 mode, packet privileges, and the correct 2.4 GHz channel. Linux adapters with
 monitor/injection support are the most practical route. Apple's built-in macOS
 Wi-Fi driver normally supports monitor capture but not raw frame injection, so
 Mac users will generally need a compatible external adapter (often passed to a
-Linux VM). PictoChat's surrounding NiFi session is request/relay driven; the raw
-sender reproduces the observed image frames, but joining and coordinating a
-real room remains experimental rather than guaranteed.
+Linux VM). PictoChat's surrounding NiFi session is request/relay driven.
+Airwriter listens for Nintendo beacons to discover the host, uploads the shorter
+client-side `56 8e` frames, watches for the host's longer `e6 03` rebroadcasts,
+and retries only chunks that were not relayed. The client MAC must belong to a
+DS already joined to that room: the available capture starts after association
+and does not contain the handshake needed to create a participant from scratch.
 
 Airwriter writes each frame directly through Scapy's layer-2 socket so a BPF or
-driver rejection identifies the exact pass and frame. Detailed errors, errno,
+driver rejection identifies the exact attempt and frame. Detailed errors, errno,
 traceback, and the macOS interface state are printed to stderr and shown in a
 copyable diagnostic window. A successful write only means the kernel accepted
 the bytes; macOS firmware can still discard unsupported injection silently.

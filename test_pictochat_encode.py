@@ -16,9 +16,12 @@ from pictochat_decode import (
 )
 from pictochat_encode import (
     add_radiotap_and_fcs,
+    build_dot11_frame,
     build_message_chunks,
     build_transmission,
     encode_4bpp_tiles,
+    extract_host_relay,
+    find_pictochat_host,
     image_to_indices,
     parse_mac,
     write_pcap,
@@ -34,8 +37,26 @@ class EncoderTests(unittest.TestCase):
         scapy_conf.L2socket.return_value = radio_socket
         radio_tap = MagicMock()
         radio_tap.return_value.__truediv__.return_value = object()
-        fake_scapy = MagicMock(RadioTap=radio_tap, Raw=MagicMock(), conf=scapy_conf)
-        worker = InjectionWorker(Queue(), "wlan0", [b"frame"], 1, 0)
+        async_sniffer = MagicMock()
+        frames = []
+        for index in range(64):
+            frame = bytearray(200)
+            frame[34:36] = (0xA0 + index * 0xA0).to_bytes(2, "little")
+            frames.append(bytes(frame))
+        fake_scapy = MagicMock(
+            AsyncSniffer=async_sniffer,
+            RadioTap=radio_tap,
+            Raw=MagicMock(),
+            conf=scapy_conf,
+        )
+        worker = InjectionWorker(
+            Queue(),
+            "wlan0",
+            lambda _host: frames,
+            parse_mac("a4:c0:e1:e5:a5:9b"),
+            1,
+            0,
+        )
 
         with (
             patch.dict("sys.modules", {"scapy": MagicMock(), "scapy.all": fake_scapy}),
@@ -44,8 +65,10 @@ class EncoderTests(unittest.TestCase):
             worker.run()
 
         scapy_conf.L2socket.assert_called_once_with(iface="wlan0")
-        radio_socket.send.assert_called_once()
+        self.assertEqual(radio_socket.send.call_count, 64)
         radio_socket.close.assert_called_once()
+        async_sniffer.return_value.start.assert_called_once()
+        async_sniffer.return_value.stop.assert_called_once()
 
     def test_linux_monitor_setup_uses_argument_lists(self):
         paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw"}
@@ -87,10 +110,19 @@ class EncoderTests(unittest.TestCase):
         self.assertEqual(reconstructed[4:4 + len(data)], data)
         self.assertEqual(chunks[-1].offset, 0x28A0)
 
-    def test_decoder_accepts_final_four_bytes(self):
+    def test_host_relay_shape_can_round_trip_final_four_bytes(self):
         indices = [[(x + y) % 2 for x in range(CANVAS_W)] for y in range(CANVAS_H)]
         encoded = encode_4bpp_tiles(indices)
-        frames = build_transmission(indices, parse_mac("02:00:00:00:00:01"), 1, 1)
+        chunks = build_message_chunks(encoded)
+        frames = [
+            build_dot11_frame(
+                chunk,
+                parse_mac("a4:c0:e1:e5:a5:9b"),
+                index + 1,
+                index + 1,
+            )
+            for index, chunk in enumerate(chunks)
+        ]
         output = bytearray(len(encoded))
         for packet_index, frame in enumerate(frames):
             packet = list(add_radiotap_and_fcs(frame))
@@ -99,25 +131,47 @@ class EncoderTests(unittest.TestCase):
             write_chunk_to_image_buffer(output, candidates[0].chunk_offset, candidates[0].payload)
         self.assertEqual(bytes(output), encoded)
 
-    def test_frame_matches_observed_shape(self):
+    def test_client_frame_matches_observed_upload_shape(self):
         blank = [[0] * CANVAS_W for _ in range(CANVAS_H)]
-        frames = build_transmission(blank, parse_mac("a4:c0:e1:e5:a5:9b"), 0x11BA, 0xCD0)
-        self.assertEqual(len(frames), 65)
-        self.assertTrue(all(len(frame) == 206 for frame in frames))
-        self.assertEqual(frames[0][0:2], bytes.fromhex("28 02"))
-        self.assertEqual(frames[0][4:10], bytes.fromhex("03 09 bf 00 00 00"))
-        self.assertEqual(frames[0][38:40], bytes.fromhex("a0 00"))
-        self.assertEqual(len(add_radiotap_and_fcs(frames[0])), 220)
+        client = parse_mac("a4:c0:e1:19:b8:79")
+        host = parse_mac("a4:c0:e1:e5:a5:9b")
+        frames = build_transmission(blank, client, host, 0x0912, 0xDC0)
+        self.assertEqual(len(frames), 64)
+        self.assertTrue(all(len(frame) == 200 for frame in frames))
+        self.assertEqual(frames[0][0:2], bytes.fromhex("18 11"))
+        self.assertEqual(frames[0][4:10], host)
+        self.assertEqual(frames[0][10:16], client)
+        self.assertEqual(frames[0][16:22], bytes.fromhex("03 09 bf 00 00 10"))
+        self.assertEqual(frames[0][24:34], bytes.fromhex("56 8e 02 00 ac 00 01 04 a0 00"))
+        self.assertEqual(frames[0][34:38], bytes.fromhex("a0 00 00 00"))
+        self.assertEqual(frames[0][-2:], bytes.fromhex("12 09"))
+        self.assertEqual(frames[-1][34:36], bytes.fromhex("00 28"))
+        self.assertEqual(len(add_radiotap_and_fcs(frames[0])), 214)
+
+    def test_host_relay_is_discovered_and_acknowledges_payload(self):
+        data = bytes(index % 251 for index in range(0x2800))
+        chunk = build_message_chunks(data)[0]
+        host = parse_mac("a4:c0:e1:e5:a5:9b")
+        relay = build_dot11_frame(chunk, host, 0xCD0, 0x11BA)
+        packet = add_radiotap_and_fcs(relay)
+        self.assertEqual(find_pictochat_host(packet), host)
+        self.assertEqual(extract_host_relay(packet, host), (chunk.offset, chunk.payload))
 
     def test_image_import_and_pcap_export(self):
         source = Image.new("RGB", (20, 20), "black")
         indices = image_to_indices(source)
         self.assertTrue(any(any(row) for row in indices))
-        frames = build_transmission(indices, parse_mac("02:00:00:00:00:01"), 1, 1)
+        frames = build_transmission(
+            indices,
+            parse_mac("02:00:00:00:00:01"),
+            parse_mac("a4:c0:e1:e5:a5:9b"),
+            1,
+            1,
+        )
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "drawing.pcap"
             write_pcap(output, frames)
-            self.assertGreater(output.stat().st_size, 65 * 220)
+            self.assertGreater(output.stat().st_size, 64 * 214)
 
 
 if __name__ == "__main__":

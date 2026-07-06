@@ -15,12 +15,15 @@ import traceback
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 
 from PIL import Image, ImageTk
 
 from pictochat_decode import CANVAS_H, CANVAS_W, PICTOCHAT_PALETTE
 from pictochat_encode import (
     build_transmission,
+    extract_host_relay,
+    find_pictochat_host,
     image_to_indices,
     indices_to_image,
     parse_mac,
@@ -40,7 +43,7 @@ from pictochat_live import (
 
 
 PREVIEW_SCALE = 3
-DEFAULT_MAC = "02:00:00:00:00:01"
+DEFAULT_MAC = ""
 PEN_COLOURS: tuple[tuple[str, int], ...] = (
     ("Black", 1),
     ("Pink", 3),
@@ -79,26 +82,70 @@ def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
 
 class InjectionWorker(threading.Thread):
     def __init__(self, events: queue.Queue[tuple[str, str]], interface: str,
-                 frames: list[bytes], repetitions: int, interval: float,
-                 channel: int = 1, configure_linux: bool = False) -> None:
+                 frame_builder: Callable[[bytes], list[bytes]], host_mac: bytes | None,
+                 attempts: int, interval: float, channel: int = 1,
+                 configure_linux: bool = False, discovery_timeout: float = 3.0) -> None:
         super().__init__(daemon=True)
         self.events = events
         self.interface = interface
-        self.frames = frames
-        self.repetitions = repetitions
+        self.frame_builder = frame_builder
+        self.host_mac = host_mac
+        self.attempts = attempts
         self.interval = interval
         self.channel = channel
         self.configure_linux = configure_linux
+        self.discovery_timeout = discovery_timeout
 
     def run(self) -> None:
         radio_socket = None
-        repetition = 0
+        sniffer = None
+        attempt = 0
         frame_index = 0
+        discovered_host = self.host_mac
+        host_found = threading.Event()
+        relay_seen = threading.Event()
+        acknowledged: set[int] = set()
+        sent_offsets: set[int] = set()
+        expected_payloads: dict[int, bytes] = {}
+
+        def observe(packet: object) -> None:
+            nonlocal discovered_host
+            raw = bytes(packet)
+            found = find_pictochat_host(raw)
+            if discovered_host is None and found is not None:
+                discovered_host = found
+                host_found.set()
+            relay = extract_host_relay(raw, discovered_host)
+            if relay is None:
+                return
+            offset, payload = relay
+            if offset in sent_offsets and expected_payloads.get(offset) == payload:
+                acknowledged.add(offset)
+                relay_seen.set()
+
         try:
-            from scapy.all import RadioTap, Raw, conf
+            from scapy.all import AsyncSniffer, RadioTap, Raw, conf
             if sys.platform.startswith("linux") and self.configure_linux:
                 self._configure_linux_monitor()
-            packets = [RadioTap() / Raw(frame) for frame in self.frames]
+            sniffer = AsyncSniffer(iface=self.interface, prn=observe, store=False)
+            sniffer.start()
+            if discovered_host is None:
+                self.events.put(("progress", "Listening for a PictoChat room host…"))
+                if not host_found.wait(self.discovery_timeout) or discovered_host is None:
+                    raise TimeoutError(
+                        "No PictoChat host was heard. Check the channel, or enter the host MAC manually."
+                    )
+            self.events.put(
+                ("progress", f"Using room host {discovered_host.hex(':')} — preparing 64 chunks…")
+            )
+            frames = self.frame_builder(discovered_host)
+            if len(frames) != 64:
+                raise ValueError(f"Client transmission must contain 64 chunks, got {len(frames)}")
+            expected_payloads = {
+                int.from_bytes(frame[34:36], "little"): frame[38:198]
+                for frame in frames
+            }
+            packets = [RadioTap() / Raw(frame) for frame in frames]
             # Opening and writing the L2 socket ourselves lets us identify the
             # exact frame whose BPF/driver write failed. sendp() otherwise
             # collapses the whole batch into one fairly opaque exception.
@@ -107,25 +154,57 @@ class InjectionWorker(threading.Thread):
             # interface has already been put into monitor mode with iw above,
             # so passing only its name works on Linux as well as macOS/BPF.
             radio_socket = conf.L2socket(iface=self.interface)
-            for repetition in range(self.repetitions):
-                for frame_index, packet in enumerate(packets):
+            for attempt in range(self.attempts):
+                pending = [
+                    (index, packet)
+                    for index, (frame, packet) in enumerate(zip(frames, packets))
+                    if int.from_bytes(frame[34:36], "little") not in acknowledged
+                ]
+                if not pending:
+                    break
+                relay_seen.clear()
+                for frame_index, packet in pending:
+                    sent_offsets.add(int.from_bytes(frames[frame_index][34:36], "little"))
                     written = radio_socket.send(packet)
                     if isinstance(written, int) and written <= 0:
                         raise OSError(f"driver accepted only {written} bytes")
                     if self.interval:
                         time.sleep(self.interval)
-                self.events.put(("progress", f"Pass {repetition + 1}/{self.repetitions} sent"))
-            message = (
-                f"Kernel accepted {len(self.frames) * self.repetitions} frame writes; "
-                "this does not prove they reached the air"
-            )
+                # Host relays arrive shortly after uploads.  Waiting here makes
+                # subsequent attempts selective instead of repeating the whole image.
+                settle_deadline = time.monotonic() + max(0.25, self.interval * 64)
+                while len(acknowledged) < 64:
+                    remaining = settle_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    relay_seen.wait(min(0.05, remaining))
+                    relay_seen.clear()
+                self.events.put(
+                    (
+                        "progress",
+                        f"Attempt {attempt + 1}/{self.attempts}: "
+                        f"{len(acknowledged)}/64 chunks relayed by host",
+                    )
+                )
+            if len(acknowledged) == 64:
+                message = "Host relayed all 64 drawing chunks"
+            else:
+                message = (
+                    f"Host relayed {len(acknowledged)}/64 chunks after {self.attempts} attempts; "
+                    "unconfirmed chunks may require another send"
+                )
             print(f"[PictoChat Airwriter] {message}", flush=True)
             self.events.put(("done", message))
         except Exception as exc:
-            detail = self._error_detail(exc, repetition, frame_index)
+            detail = self._error_detail(exc, attempt, frame_index)
             print(detail, file=sys.stderr, flush=True)
             self.events.put(("error", detail))
         finally:
+            if sniffer is not None:
+                try:
+                    sniffer.stop()
+                except Exception:
+                    pass
             if radio_socket is not None:
                 try:
                     radio_socket.close()
@@ -150,12 +229,12 @@ class InjectionWorker(threading.Thread):
                     f"{detail or f'exit status {result.returncode}'}"
                 )
 
-    def _error_detail(self, exc: Exception, repetition: int, frame_index: int) -> str:
+    def _error_detail(self, exc: Exception, attempt: int, frame_index: int) -> str:
         lines = [
             "PictoChat Airwriter — raw injection failure",
             f"Platform: {platform.platform()}",
             f"Interface: {self.interface}",
-            f"Pass/frame: {repetition + 1}/{frame_index + 1}",
+            f"Attempt/frame: {attempt + 1}/{frame_index + 1}",
             f"Exception: {type(exc).__name__}: {exc}",
         ]
         error_number = getattr(exc, "errno", None)
@@ -232,6 +311,7 @@ class PictoChatSendApp:
 
         self.interface_var = tk.StringVar()
         self.mac_var = tk.StringVar(value=DEFAULT_MAC)
+        self.host_mac_var = tk.StringVar()
         self.tool_var = tk.StringVar(value="Pen")
         self.pen_colour_var = tk.StringVar(value="Black")
         self.brush_var = tk.IntVar(value=2)
@@ -334,12 +414,15 @@ class PictoChatSendApp:
                 selectcolor=PANEL_2,
                 highlightthickness=0,
             ).pack(anchor="w", pady=(0, 8))
-        tk.Label(controls, text="Source MAC / room identity", bg=PANEL, fg=MUTED,
+        tk.Label(controls, text="Joined client MAC", bg=PANEL, fg=MUTED,
                  font=("TkDefaultFont", 9)).pack(anchor="w")
         self._entry(controls, self.mac_var).pack(fill="x", ipady=7, pady=(5, 8))
+        tk.Label(controls, text="Host MAC (blank = discover)", bg=PANEL, fg=MUTED,
+                 font=("TkDefaultFont", 9)).pack(anchor="w")
+        self._entry(controls, self.host_mac_var).pack(fill="x", ipady=7, pady=(5, 8))
         spinrow = tk.Frame(controls, bg=PANEL)
         spinrow.pack(fill="x", pady=(0, 10))
-        tk.Label(spinrow, text="Passes", bg=PANEL, fg=MUTED).pack(side="left")
+        tk.Label(spinrow, text="Attempts", bg=PANEL, fg=MUTED).pack(side="left")
         tk.Spinbox(spinrow, from_=1, to=20, textvariable=self.repetitions_var, width=4,
                    bg=PANEL_2, fg=INK, buttonbackground=PANEL_2, relief="flat").pack(side="left", padx=(6, 14))
         tk.Label(spinrow, text="Gap (s)", bg=PANEL, fg=MUTED).pack(side="left")
@@ -350,11 +433,11 @@ class PictoChatSendApp:
         self._button(controls, "Save drawing as PNG…", self.save_png, PANEL_2, INK).pack(fill="x")
 
         if sys.platform.startswith("linux"):
-            note = ("Linux auto-setup needs root/CAP_NET_ADMIN and CAP_NET_RAW. It changes the "
-                    "selected adapter to monitor mode and leaves it there when finished.")
+            note = ("Use the MAC of a DS already joined to the room. Linux auto-setup needs "
+                    "CAP_NET_ADMIN/CAP_NET_RAW and leaves the adapter in monitor mode.")
         else:
-            note = ("Requires an injection-capable adapter in monitor mode. The built-in macOS "
-                    "Wi-Fi driver normally cannot inject. PictoChat session participation remains experimental.")
+            note = ("Use the MAC of a DS already joined to the room. Requires an injection-capable "
+                    "monitor adapter; built-in macOS Wi-Fi normally cannot inject.")
         tk.Label(controls, text=note, wraplength=245, justify="left", bg=PANEL,
                  fg=MUTED, font=("TkDefaultFont", 9)).pack(side="bottom", anchor="w")
 
@@ -447,10 +530,18 @@ class PictoChatSendApp:
         self._render()
         self.status_var.set("Canvas cleared")
 
-    def _frames(self) -> list[bytes]:
-        return build_transmission(self.indices, parse_mac(self.mac_var.get()),
-                                  message_id=random.randrange(0x10000),
-                                  sequence_start=random.randrange(0x1000))
+    def _frames(self, host_mac: bytes | None = None) -> list[bytes]:
+        if host_mac is None:
+            if not self.host_mac_var.get().strip():
+                raise ValueError("Enter a host MAC before exporting a PCAP")
+            host_mac = parse_mac(self.host_mac_var.get())
+        return build_transmission(
+            self.indices,
+            parse_mac(self.mac_var.get()),
+            host_mac,
+            message_id=random.randrange(0x10000),
+            sequence_start=random.randrange(0x1000),
+        )
 
     def send(self) -> None:
         if not self.interface_var.get():
@@ -460,7 +551,15 @@ class PictoChatSendApp:
             interval = float(self.interval_var.get())
             if not 0 <= interval <= 1:
                 raise ValueError("Frame gap must be between 0 and 1 second")
-            frames = self._frames()
+            source_mac = parse_mac(self.mac_var.get())
+            configured_host = (
+                parse_mac(self.host_mac_var.get())
+                if self.host_mac_var.get().strip()
+                else None
+            )
+            indices = [row[:] for row in self.indices]
+            message_id = random.randrange(0x10000)
+            sequence_start = random.randrange(0x1000)
         except ValueError as exc:
             messagebox.showerror("Invalid radio setting", str(exc))
             return
@@ -475,10 +574,27 @@ class PictoChatSendApp:
         if not messagebox.askokcancel("Experimental transmission", warning, icon="warning"):
             return
         self.send_button.set_enabled(False)
-        self.status_var.set(f"Sending 65 chunks on {self.interface_var.get()}…")
-        InjectionWorker(self.events, self.interface_var.get(), frames,
-                        self.repetitions_var.get(), interval,
-                        self.channel_var.get(), self.configure_linux_var.get()).start()
+        self.status_var.set(f"Finding room and sending 64 chunks on {self.interface_var.get()}…")
+
+        def frame_builder(host_mac: bytes) -> list[bytes]:
+            return build_transmission(
+                indices,
+                source_mac,
+                host_mac,
+                message_id=message_id,
+                sequence_start=sequence_start,
+            )
+
+        InjectionWorker(
+            self.events,
+            self.interface_var.get(),
+            frame_builder,
+            configured_host,
+            self.repetitions_var.get(),
+            interval,
+            self.channel_var.get(),
+            self.configure_linux_var.get(),
+        ).start()
 
     def export_pcap(self) -> None:
         filename = filedialog.asksaveasfilename(defaultextension=".pcap", filetypes=[("Packet capture", "*.pcap")])
@@ -486,7 +602,7 @@ class PictoChatSendApp:
             return
         try:
             write_pcap(Path(filename), self._frames(), float(self.interval_var.get()))
-            self.status_var.set(f"Wrote 65 frames to {Path(filename).name}")
+            self.status_var.set(f"Wrote 64 client frames to {Path(filename).name}")
         except Exception as exc:
             messagebox.showerror("Could not export packets", str(exc))
 
@@ -522,7 +638,7 @@ class PictoChatSendApp:
         shell.pack(fill="both", expand=True)
         tk.Label(
             shell,
-            text="The driver or packet socket rejected the transmission",
+            text="The transmission could not complete",
             bg=BG,
             fg=WARNING,
             font=("TkDefaultFont", 13, "bold"),
