@@ -137,16 +137,25 @@ class InjectionWorker(threading.Thread):
                         "No PictoChat host was heard. Check the channel, or enter the host MAC manually."
                     )
             self.events.put(
-                ("progress", f"Using room host {discovered_host.hex(':')} — preparing 64 chunks…")
+                (
+                    "progress",
+                    f"Using room host {discovered_host.hex(':')} — preparing transfer header and 64 chunks…",
+                )
             )
             frames = self.frame_builder(discovered_host)
-            if len(frames) != 64:
-                raise ValueError(f"Client transmission must contain 64 chunks, got {len(frames)}")
+            if len(frames) != 65:
+                raise ValueError(
+                    f"Client transmission must contain one transfer header and 64 chunks, "
+                    f"got {len(frames)} frames"
+                )
+            transfer_header = frames[0]
+            chunk_frames = frames[1:]
             expected_payloads = {
                 int.from_bytes(frame[34:36], "little"): frame[38:198]
-                for frame in frames
+                for frame in chunk_frames
             }
-            packets = [RadioTap() / Raw(frame) for frame in frames]
+            transfer_packet = RadioTap() / Raw(transfer_header)
+            chunk_packets = [RadioTap() / Raw(frame) for frame in chunk_frames]
             # Opening and writing the L2 socket ourselves lets us identify the
             # exact frame whose BPF/driver write failed. sendp() otherwise
             # collapses the whole batch into one fairly opaque exception.
@@ -158,14 +167,23 @@ class InjectionWorker(threading.Thread):
             for attempt in range(self.attempts):
                 pending = [
                     (index, packet)
-                    for index, (frame, packet) in enumerate(zip(frames, packets))
+                    for index, (frame, packet) in enumerate(zip(chunk_frames, chunk_packets))
                     if int.from_bytes(frame[34:36], "little") not in acknowledged
                 ]
                 if not pending:
                     break
                 relay_seen.clear()
+                # The 0x97 transfer header is not optional: the host relays it
+                # before it treats subsequent 0x04 frames as drawing chunks.
+                # Reannounce it on each retry, as Nintendo clients do.
+                written = radio_socket.send(transfer_packet)
+                if isinstance(written, int) and written <= 0:
+                    raise OSError(f"driver accepted only {written} bytes for transfer header")
+                time.sleep(max(0.01, self.interval * 3))
                 for frame_index, packet in pending:
-                    sent_offsets.add(int.from_bytes(frames[frame_index][34:36], "little"))
+                    sent_offsets.add(
+                        int.from_bytes(chunk_frames[frame_index][34:36], "little")
+                    )
                     written = radio_socket.send(packet)
                     if isinstance(written, int) and written <= 0:
                         raise OSError(f"driver accepted only {written} bytes")
@@ -604,7 +622,9 @@ class PictoChatSendApp:
             return
         try:
             write_pcap(Path(filename), self._frames(), float(self.interval_var.get()))
-            self.status_var.set(f"Wrote 64 client frames to {Path(filename).name}")
+            self.status_var.set(
+                f"Wrote transfer header and 64 client chunks to {Path(filename).name}"
+            )
         except Exception as exc:
             messagebox.showerror("Could not export packets", str(exc))
 

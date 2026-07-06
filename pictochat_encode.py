@@ -30,6 +30,7 @@ PICTOCHAT_GROUP = bytes.fromhex("03 09 bf 00 00 00")
 PICTOCHAT_CLIENT_GROUP = bytes.fromhex("03 09 bf 00 00 10")
 HOST_RELAY_PREFIX = bytes.fromhex("e6 03 02 00 56 1e 02 00 ac 00 01 04 a0 00")
 CLIENT_UPLOAD_PREFIX = bytes.fromhex("56 8e 02 00 ac 00 01 04 a0 00")
+CLIENT_TRANSFER_PREFIX = bytes.fromhex("56 8e 02 00 ac 00 01 97 a0 00")
 RADIOTAP_F_FCS = 0x10
 WIRE_CHUNK_COUNT = IMAGE_BUFFER_SIZE // CHUNK_PAYLOAD_LEN
 
@@ -176,6 +177,44 @@ def build_client_dot11_frame(
     return header + protocol + chunk.payload + footer
 
 
+def build_client_transfer_header(
+    source_mac: bytes,
+    host_mac: bytes,
+    sequence: int,
+    message_id: int,
+) -> bytes:
+    """Build the transfer-announcement frame sent before the image chunks.
+
+    The room host does not accept standalone ``0x04`` chunks.  A real client
+    first announces a drawing with an ``0x97`` frame containing its MAC in
+    little-endian 16-bit words and a short, capture-observed capability block.
+    """
+    if len(source_mac) != 6 or len(host_mac) != 6:
+        raise ValueError("source_mac and host_mac must each contain six bytes")
+    word_swapped_mac = b"".join(
+        source_mac[index : index + 2][::-1] for index in range(0, 6, 2)
+    )
+    payload = (
+        bytes.fromhex("03 02")
+        + word_swapped_mac
+        + bytes.fromhex("00 05 00 00 00 00 03 06 08 0d 08 0d 12 1b")
+    )
+    payload += bytes(CHUNK_PAYLOAD_LEN - len(payload))
+    frame_control = 0x1118
+    duration = 0x0146
+    sequence_control = (sequence & 0x0FFF) << 4
+    header = struct.pack("<HH", frame_control, duration)
+    header += host_mac + source_mac + PICTOCHAT_CLIENT_GROUP
+    header += struct.pack("<H", sequence_control)
+    return (
+        header
+        + CLIENT_TRANSFER_PREFIX
+        + bytes(4)  # transfer offset and reserved field
+        + payload
+        + struct.pack("<H", message_id & 0xFFFF)
+    )
+
+
 def add_radiotap_and_fcs(dot11_frame: bytes) -> bytes:
     """Wrap a frame for a PCAP. Injection normally lets the adapter add FCS."""
     # version, pad, length, present bitmap (Flags), Flags(FCS present), padding
@@ -243,7 +282,7 @@ def build_transmission(
     message_id: int | None = None,
     sequence_start: int = 0,
 ) -> list[bytes]:
-    """Build one capture-compatible client upload cycle.
+    """Build one capture-compatible transfer header and client upload cycle.
 
     Nintendo sends 64 chunks, ending at logical offset 0x2800.  Although the
     four-byte message envelope makes a 65th chunk useful for lossless local
@@ -252,16 +291,23 @@ def build_transmission(
     if message_id is None:
         message_id = int(time.time() * 1000) & 0xFFFF
     chunks = build_message_chunks(encode_4bpp_tiles(indices))[:WIRE_CHUNK_COUNT]
-    return [
+    transfer_header = build_client_transfer_header(
+        source_mac,
+        host_mac,
+        sequence_start,
+        message_id,
+    )
+    chunk_frames = [
         build_client_dot11_frame(
             chunk,
             source_mac,
             host_mac,
-            sequence_start + index,
-            message_id + index,
+            sequence_start + index + 1,
+            message_id + index + 1,
         )
         for index, chunk in enumerate(chunks)
     ]
+    return [transfer_header, *chunk_frames]
 
 
 def write_pcap(path: Path, frames: Iterable[bytes], interval: float = 0.003) -> None:

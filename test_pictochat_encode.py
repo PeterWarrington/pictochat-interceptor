@@ -17,6 +17,7 @@ from pictochat_decode import (
 from pictochat_encode import (
     add_radiotap_and_fcs,
     build_dot11_frame,
+    build_client_transfer_header,
     build_message_chunks,
     build_transmission,
     encode_4bpp_tiles,
@@ -38,7 +39,7 @@ class EncoderTests(unittest.TestCase):
         radio_tap = MagicMock()
         radio_tap.return_value.__truediv__.return_value = object()
         async_sniffer = MagicMock()
-        frames = []
+        frames = [bytes(200)]
         for index in range(64):
             frame = bytearray(200)
             frame[34:36] = (0xA0 + index * 0xA0).to_bytes(2, "little")
@@ -65,7 +66,7 @@ class EncoderTests(unittest.TestCase):
             worker.run()
 
         scapy_conf.L2socket.assert_called_once_with(iface="wlan0")
-        self.assertEqual(radio_socket.send.call_count, 64)
+        self.assertEqual(radio_socket.send.call_count, 65)
         radio_socket.close.assert_called_once()
         async_sniffer.return_value.start.assert_called_once()
         async_sniffer.return_value.stop.assert_called_once()
@@ -135,18 +136,36 @@ class EncoderTests(unittest.TestCase):
         blank = [[0] * CANVAS_W for _ in range(CANVAS_H)]
         client = parse_mac("a4:c0:e1:19:b8:79")
         host = parse_mac("a4:c0:e1:e5:a5:9b")
-        frames = build_transmission(blank, client, host, 0x0912, 0xDC0)
-        self.assertEqual(len(frames), 64)
+        frames = build_transmission(blank, client, host, 0x0911, 0xDBF)
+        self.assertEqual(len(frames), 65)
         self.assertTrue(all(len(frame) == 200 for frame in frames))
-        self.assertEqual(frames[0][0:2], bytes.fromhex("18 11"))
-        self.assertEqual(frames[0][4:10], host)
-        self.assertEqual(frames[0][10:16], client)
-        self.assertEqual(frames[0][16:22], bytes.fromhex("03 09 bf 00 00 10"))
-        self.assertEqual(frames[0][24:34], bytes.fromhex("56 8e 02 00 ac 00 01 04 a0 00"))
-        self.assertEqual(frames[0][34:38], bytes.fromhex("a0 00 00 00"))
-        self.assertEqual(frames[0][-2:], bytes.fromhex("12 09"))
+        self.assertEqual(frames[1][0:2], bytes.fromhex("18 11"))
+        self.assertEqual(frames[1][4:10], host)
+        self.assertEqual(frames[1][10:16], client)
+        self.assertEqual(frames[1][16:22], bytes.fromhex("03 09 bf 00 00 10"))
+        self.assertEqual(frames[1][24:34], bytes.fromhex("56 8e 02 00 ac 00 01 04 a0 00"))
+        self.assertEqual(frames[1][34:38], bytes.fromhex("a0 00 00 00"))
+        self.assertEqual(frames[1][-2:], bytes.fromhex("12 09"))
+        self.assertEqual(add_radiotap_and_fcs(frames[1])[-4:], bytes.fromhex("21 2d 22 79"))
         self.assertEqual(frames[-1][34:36], bytes.fromhex("00 28"))
         self.assertEqual(len(add_radiotap_and_fcs(frames[0])), 214)
+
+    def test_transfer_header_matches_observed_nintendo_announcement(self):
+        client = parse_mac("a4:c0:e1:19:b8:79")
+        host = parse_mac("a4:c0:e1:e5:a5:9b")
+        frame = build_client_transfer_header(client, host, 0xDBF, 0x0911)
+        self.assertEqual(len(frame), 200)
+        self.assertEqual(frame[22:24], bytes.fromhex("f0 db"))
+        self.assertEqual(frame[24:34], bytes.fromhex("56 8e 02 00 ac 00 01 97 a0 00"))
+        self.assertEqual(frame[34:38], bytes(4))
+        self.assertEqual(
+            frame[38:60],
+            bytes.fromhex(
+                "03 02 c0 a4 19 e1 79 b8 00 05 00 00 00 00 03 06 08 0d 08 0d 12 1b"
+            ),
+        )
+        self.assertEqual(frame[-2:], bytes.fromhex("11 09"))
+        self.assertEqual(add_radiotap_and_fcs(frame)[-4:], bytes.fromhex("ef e8 fd e8"))
 
     def test_host_relay_is_discovered_and_acknowledges_payload(self):
         data = bytes(index % 251 for index in range(0x2800))
@@ -171,7 +190,7 @@ class EncoderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "drawing.pcap"
             write_pcap(output, frames)
-            self.assertGreater(output.stat().st_size, 64 * 214)
+            self.assertGreater(output.stat().st_size, 65 * 214)
 
 
 if __name__ == "__main__":
