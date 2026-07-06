@@ -46,7 +46,7 @@ def parse_mac(value: str) -> bytes:
 
 
 def image_to_indices(image: Image.Image, threshold: int = 180) -> list[list[int]]:
-    """Fit an image to the canvas and reduce it to PictoChat paper/black ink."""
+    """Fit an image to the canvas and reduce it to PictoChat colour."""
     source = image.convert("RGBA")
     source.thumbnail((CANVAS_W, CANVAS_H), Image.Resampling.LANCZOS)
     fitted = Image.new("RGBA", (CANVAS_W, CANVAS_H), (255, 255, 255, 255))
@@ -57,8 +57,10 @@ def image_to_indices(image: Image.Image, threshold: int = 180) -> list[list[int]
     rgb = fitted.convert("RGB")
     raw_pixels = rgb.tobytes()
     return [
+        # match the palette index to closest colour if the pixel is dark enough, otherwise use white (index 0)
+        # with alpha to white
         [
-            1
+            PICTOCHAT_PALETTE.index(min(PICTOCHAT_PALETTE, key=lambda c: sum(abs(c[i] - raw_pixels[(y * CANVAS_W + x) * 3 + i]) for i in range(3))))
             if sum(raw_pixels[(y * CANVAS_W + x) * 3 : (y * CANVAS_W + x + 1) * 3]) // 3
             < threshold
             else 0
