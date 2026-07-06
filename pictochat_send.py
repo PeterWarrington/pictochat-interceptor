@@ -62,6 +62,9 @@ PEN_COLOURS: tuple[tuple[str, int], ...] = (
     ("Indigo", 15),
 )
 PEN_INDICES = dict(PEN_COLOURS)
+NINTENDO_RATE_MBPS = 2
+RADIOTAP_SHORT_PREAMBLE = 0x02
+RADIOTAP_TX_NOACK = 0x0008
 
 
 def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
@@ -154,8 +157,23 @@ class InjectionWorker(threading.Thread):
                 int.from_bytes(frame[34:36], "little"): frame[38:198]
                 for frame in chunk_frames
             }
-            transfer_packet = RadioTap() / Raw(transfer_header)
-            chunk_packets = [RadioTap() / Raw(frame) for frame in chunk_frames]
+            # An empty radiotap header makes mac80211 choose its conservative
+            # 1 Mbps/long-preamble fallback.  The DS capture uses 2 Mbps with
+            # a short preamble for every client upload.  PictoChat confirms
+            # uploads with host relay frames rather than conventional control
+            # ACKs, so also suppress mac80211's multi-second retry cycle.
+            # Radiotap Rate is expressed in Mbps by Scapy and serialized in
+            # 500 kbps units.
+            def injection_packet(frame: bytes) -> object:
+                return RadioTap(
+                    present="Flags+Rate+TXFlags",
+                    Flags=RADIOTAP_SHORT_PREAMBLE,
+                    Rate=NINTENDO_RATE_MBPS,
+                    TXFlags=RADIOTAP_TX_NOACK,
+                ) / Raw(frame)
+
+            transfer_packet = injection_packet(transfer_header)
+            chunk_packets = [injection_packet(frame) for frame in chunk_frames]
             # Opening and writing the L2 socket ourselves lets us identify the
             # exact frame whose BPF/driver write failed. sendp() otherwise
             # collapses the whole batch into one fairly opaque exception.

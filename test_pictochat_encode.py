@@ -28,7 +28,13 @@ from pictochat_encode import (
     write_pcap,
 )
 from pictochat_live import EXPECTED_CHUNKS, LAST_CHUNK_OFFSET
-from pictochat_send import InjectionWorker, linux_monitor_commands
+from pictochat_send import (
+    NINTENDO_RATE_MBPS,
+    RADIOTAP_SHORT_PREAMBLE,
+    RADIOTAP_TX_NOACK,
+    InjectionWorker,
+    linux_monitor_commands,
+)
 
 
 class EncoderTests(unittest.TestCase):
@@ -66,6 +72,13 @@ class EncoderTests(unittest.TestCase):
             worker.run()
 
         scapy_conf.L2socket.assert_called_once_with(iface="wlan0")
+        self.assertEqual(radio_tap.call_count, 65)
+        radio_tap.assert_called_with(
+            present="Flags+Rate+TXFlags",
+            Flags=RADIOTAP_SHORT_PREAMBLE,
+            Rate=NINTENDO_RATE_MBPS,
+            TXFlags=RADIOTAP_TX_NOACK,
+        )
         self.assertEqual(radio_socket.send.call_count, 65)
         radio_socket.close.assert_called_once()
         async_sniffer.return_value.start.assert_called_once()
