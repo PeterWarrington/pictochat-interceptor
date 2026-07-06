@@ -264,6 +264,7 @@ class CaptureWorker(threading.Thread):
             try:
                 self._run_windows_capture()
             except Exception as exc:
+                print(f"Windows capture failed: {exc}")
                 if not self.stop_event.is_set():
                     self.output.put(
                         (
@@ -373,6 +374,7 @@ class CaptureWorker(threading.Thread):
         }
         if self.capture_filter.strip():
             socket_options["filter"] = self.capture_filter.strip()
+        conf.iface.setmonitor(True)
         capture_socket = conf.L2listen(**socket_options)
         try:
             self.output.put(
