@@ -1,0 +1,6 @@
+test*.txt
+.build/
+__pycache__/
+build/
+dist/
+.DS_Store
