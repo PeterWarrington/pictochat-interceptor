@@ -37,6 +37,90 @@ from pictochat_send import (
 
 
 class EncoderTests(unittest.TestCase):
+    def test_worker_rejects_adapter_that_ignores_noack(self):
+        client = parse_mac("a4:c0:e1:19:b8:79")
+        host = parse_mac("a4:c0:e1:e5:a5:9b")
+        frames = []
+        for index in range(65):
+            frame = bytearray(200)
+            frame[0:2] = bytes.fromhex("18 11")
+            frame[4:10] = host
+            frame[10:16] = client
+            frame[24:28] = bytes.fromhex("56 8e 02 00")
+            frame[34:36] = (index * 0xA0).to_bytes(2, "little")
+            frames.append(bytes(frame))
+        events = Queue()
+        radio_socket = MagicMock()
+        fake_scapy = MagicMock(RadioTap=MagicMock(), Raw=MagicMock(), conf=MagicMock())
+        fake_scapy.conf.L2socket.return_value = radio_socket
+
+        sniffers = []
+
+        class RetrySniffer:
+            def __init__(self, prn, **_kwargs):
+                self.prn = prn
+                sniffers.append(self)
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        fake_scapy.AsyncSniffer = RetrySniffer
+        def send_with_retry(_packet):
+            retry = bytearray(frames[0])
+            retry[0:2] = bytes.fromhex("18 19")
+            sniffers[0].prn(bytes(retry))
+
+        radio_socket.send.side_effect = send_with_retry
+        worker = InjectionWorker(events, "wlan0", lambda _host: frames, host, 1, 0)
+
+        with (
+            patch.dict("sys.modules", {"scapy": MagicMock(), "scapy.all": fake_scapy}),
+            patch("pictochat_send.sys.platform", "test"),
+        ):
+            worker.run()
+
+        emitted = []
+        while not events.empty():
+            emitted.append(events.get_nowait())
+        self.assertTrue(
+            any(kind == "error" and "despite the NOACK" in text for kind, text in emitted)
+        )
+        self.assertEqual(radio_socket.send.call_count, 1)
+
+    def test_worker_rejects_spoofing_the_host_as_its_own_client(self):
+        host = parse_mac("a4:c0:e1:e5:a5:9b")
+        frames = []
+        for _index in range(65):
+            frame = bytearray(200)
+            frame[4:10] = host
+            frame[10:16] = host
+            frames.append(bytes(frame))
+        events = Queue()
+        fake_scapy = MagicMock(
+            AsyncSniffer=MagicMock(),
+            RadioTap=MagicMock(),
+            Raw=MagicMock(),
+            conf=MagicMock(),
+        )
+        worker = InjectionWorker(events, "wlan0", lambda _host: frames, host, 1, 0)
+
+        with (
+            patch.dict("sys.modules", {"scapy": MagicMock(), "scapy.all": fake_scapy}),
+            patch("pictochat_send.sys.platform", "darwin"),
+        ):
+            worker.run()
+
+        emitted = []
+        while not events.empty():
+            emitted.append(events.get_nowait())
+        self.assertTrue(
+            any(kind == "error" and "room host MAC" in text for kind, text in emitted)
+        )
+        fake_scapy.conf.L2socket.assert_not_called()
+
     def test_linux_injection_socket_does_not_pass_capture_only_monitor_option(self):
         radio_socket = MagicMock()
         scapy_conf = MagicMock()
@@ -109,6 +193,36 @@ class EncoderTests(unittest.TestCase):
     def test_linux_wiphy_name_rejects_missing_phy(self):
         with self.assertRaisesRegex(ValueError, "wiphy number"):
             linux_wiphy_name("Interface wlan1mon\n\ttype monitor\n")
+
+    def test_linux_driver_constraint_failures_are_nonfatal(self):
+        events = Queue()
+        worker = InjectionWorker(events, "wlan0", lambda _host: [], None, 1, 0)
+        bitrate_failure = MagicMock(
+            returncode=1,
+            stderr="command failed: Input/output error (-5)",
+            stdout="",
+        )
+        info_success = MagicMock(returncode=0, stderr="", stdout="wiphy 2\n")
+        retry_failure = MagicMock(
+            returncode=1,
+            stderr="command failed: Operation not supported (-95)",
+            stdout="",
+        )
+
+        with (
+            patch("pictochat_send.shutil.which", return_value="/usr/sbin/iw"),
+            patch(
+                "pictochat_send.subprocess.run",
+                side_effect=(bitrate_failure, info_success, retry_failure),
+            ),
+        ):
+            worker._configure_linux_injection_constraints()
+
+        messages = []
+        while not events.empty():
+            messages.append(events.get_nowait()[1])
+        self.assertTrue(any("fixed 2 Mbps" in message for message in messages))
+        self.assertTrue(any("retry tuning" in message for message in messages))
 
     def test_linux_monitor_setup_reports_missing_tools(self):
         with patch("pictochat_send.shutil.which", return_value=None):

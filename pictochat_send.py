@@ -23,6 +23,7 @@ from PIL import Image, ImageTk
 from pictochat_decode import CANVAS_H, CANVAS_W, PICTOCHAT_PALETTE
 from pictochat_encode import (
     build_transmission,
+    dot11_bytes,
     extract_host_relay,
     find_pictochat_host,
     image_to_indices,
@@ -131,10 +132,23 @@ class InjectionWorker(threading.Thread):
         acknowledged: set[int] = set()
         sent_offsets: set[int] = set()
         expected_payloads: dict[int, bytes] = {}
+        transmitted_source: bytes | None = None
+        driver_retry_seen = threading.Event()
 
         def observe(packet: object) -> None:
             nonlocal discovered_host
             raw = bytes(packet)
+            frame = dot11_bytes(raw)
+            if (
+                transmitted_source is not None
+                and len(frame) >= 34
+                and frame[10:16] == transmitted_source
+                and frame[24:28] == bytes.fromhex("56 8e 02 00")
+                and int.from_bytes(frame[0:2], "little") & 0x0800
+            ):
+                # The submitted frame has Retry clear. Seeing the same upload
+                # with Retry set proves the adapter ignored radiotap NOACK.
+                driver_retry_seen.set()
             found = find_pictochat_host(raw)
             if discovered_host is None and found is not None:
                 discovered_host = found
@@ -173,6 +187,12 @@ class InjectionWorker(threading.Thread):
                 raise ValueError(
                     f"Client transmission must contain one transfer header and 64 chunks, "
                     f"got {len(frames)} frames"
+                )
+            transmitted_source = frames[0][10:16]
+            if transmitted_source == discovered_host:
+                raise ValueError(
+                    "Joined client MAC is the room host MAC. Enter the MAC of a different "
+                    "DS/3DS that is already joined to the room."
                 )
             transfer_header = frames[0]
             chunk_frames = frames[1:]
@@ -215,7 +235,13 @@ class InjectionWorker(threading.Thread):
                 written = radio_socket.send(transfer_packet)
                 if isinstance(written, int) and written <= 0:
                     raise OSError(f"driver accepted only {written} bytes for transfer header")
-                time.sleep(max(0.01, self.interval * 3))
+                driver_retry_seen.wait(max(0.05, self.interval * 3))
+                if driver_retry_seen.is_set():
+                    raise RuntimeError(
+                        "The Wi-Fi adapter retransmitted an upload despite the NOACK request. "
+                        "Its driver/firmware does not support the injection control PictoChat "
+                        "requires; use a different mac80211 injection adapter."
+                    )
                 for frame_index, packet in pending:
                     sent_offsets.add(
                         int.from_bytes(chunk_frames[frame_index][34:36], "little")
@@ -286,7 +312,11 @@ class InjectionWorker(threading.Thread):
         self._configure_linux_injection_constraints()
 
     def _configure_linux_injection_constraints(self) -> None:
-        """Apply required PHY rate/retry settings to an existing monitor interface."""
+        """Try driver-level rate/retry fallbacks for an existing monitor interface.
+
+        Some injection drivers reject these iw settings but still honor the
+        equivalent per-packet radiotap fields, so failures here are warnings.
+        """
         iw = shutil.which("iw") or "iw"
         bitrate_command = [
             iw,
@@ -297,27 +327,47 @@ class InjectionWorker(threading.Thread):
             "legacy-2.4",
             "2",
         ]
-        bitrate = subprocess.run(
-            bitrate_command, capture_output=True, text=True, timeout=8
-        )
-        if bitrate.returncode:
+        try:
+            bitrate = subprocess.run(
+                bitrate_command, capture_output=True, text=True, timeout=8
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.events.put(("progress", f"Driver bitrate fallback unavailable: {exc}"))
+            bitrate = None
+        if bitrate is not None and bitrate.returncode:
             detail = (bitrate.stderr or bitrate.stdout).strip()
-            raise RuntimeError(
-                f"Linux bitrate setup failed ({' '.join(bitrate_command)}): "
-                f"{detail or f'exit status {bitrate.returncode}'}"
+            self.events.put(
+                (
+                    "progress",
+                    "Driver rejected fixed 2 Mbps; using the packet radiotap request: "
+                    f"{detail or f'exit status {bitrate.returncode}'}",
+                )
             )
         info_command = [iw, "dev", self.interface, "info"]
-        info = subprocess.run(info_command, capture_output=True, text=True, timeout=8)
+        try:
+            info = subprocess.run(info_command, capture_output=True, text=True, timeout=8)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.events.put(("progress", f"Driver retry fallback unavailable: {exc}"))
+            return
         if info.returncode:
             detail = (info.stderr or info.stdout).strip()
-            raise RuntimeError(
-                f"Linux wireless setup failed ({' '.join(info_command)}): "
-                f"{detail or f'exit status {info.returncode}'}"
+            self.events.put(
+                (
+                    "progress",
+                    "Could not identify the radio for retry tuning; continuing with NOACK: "
+                    f"{detail or f'exit status {info.returncode}'}",
+                )
             )
+            return
+        try:
+            wiphy = linux_wiphy_name(info.stdout)
+        except ValueError as exc:
+            self.events.put(("progress", f"Driver retry fallback unavailable: {exc}"))
+            return
         retry_command = [
             iw,
             "phy",
-            linux_wiphy_name(info.stdout),
+            wiphy,
             "set",
             "retry",
             "short",
@@ -325,12 +375,21 @@ class InjectionWorker(threading.Thread):
             "long",
             "1",
         ]
-        retry = subprocess.run(retry_command, capture_output=True, text=True, timeout=8)
+        try:
+            retry = subprocess.run(
+                retry_command, capture_output=True, text=True, timeout=8
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.events.put(("progress", f"Driver retry fallback unavailable: {exc}"))
+            return
         if retry.returncode:
             detail = (retry.stderr or retry.stdout).strip()
-            raise RuntimeError(
-                f"Linux retry setup failed ({' '.join(retry_command)}): "
-                f"{detail or f'exit status {retry.returncode}'}"
+            self.events.put(
+                (
+                    "progress",
+                    "Driver rejected retry tuning; continuing with the packet NOACK request: "
+                    f"{detail or f'exit status {retry.returncode}'}",
+                )
             )
 
     def _error_detail(self, exc: Exception, attempt: int, frame_index: int) -> str:
@@ -662,6 +721,11 @@ class PictoChatSendApp:
                 if self.host_mac_var.get().strip()
                 else None
             )
+            if configured_host == source_mac:
+                raise ValueError(
+                    "Joined client MAC and host MAC must differ; use the MAC of another "
+                    "DS/3DS already joined to the room"
+                )
             indices = [row[:] for row in self.indices]
             message_id = random.randrange(0x10000)
             sequence_start = random.randrange(0x1000)
