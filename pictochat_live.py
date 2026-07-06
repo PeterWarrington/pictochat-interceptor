@@ -138,6 +138,7 @@ class FlatButton(tk.Label):
         if inside and callable(self.command):
             self.command()
 
+
 def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
     """Commands required to prepare a Linux mac80211 interface for injection."""
     ip = shutil.which("ip")
@@ -147,12 +148,69 @@ def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
         raise FileNotFoundError(
             f"Linux wireless setup requires {missing}; install the iproute2 and iw packages"
         )
+    
+    # Check if interface exists
+    check_cmd = [ip, "link", "show", "dev", interface]
+    try:
+        subprocess.run(check_cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError:
+        raise RuntimeError(f"Network interface '{interface}' does not exist")
+    
+    # Check if we have permission to modify the interface
+    # Try a simple operation first to check permissions
+    try:
+        subprocess.run([ip, "link", "set", "dev", interface, "down"], 
+                      capture_output=True, check=True)
+        # Bring it back up if it was up before
+        subprocess.run([ip, "link", "set", "dev", interface, "up"], 
+                      capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        if "Operation not permitted" in str(e.stderr):
+            raise PermissionError(
+                f"Permission denied to modify interface '{interface}'. "
+                "Run with sudo or adjust permissions."
+            )
+        raise
+    
+    # Get current interface type
+    try:
+        info = subprocess.run([iw, "dev", interface, "info"], 
+                            capture_output=True, text=True, check=True)
+        if "type monitor" in info.stdout:
+            # Already in monitor mode, just set channel
+            return [[iw, "dev", interface, "set", "channel", str(channel)]]
+    except subprocess.CalledProcessError:
+        pass  # Continue with normal setup
+    
+    # Standard monitor mode setup
     return [
         [ip, "link", "set", "dev", interface, "down"],
         [iw, "dev", interface, "set", "type", "monitor"],
         [ip, "link", "set", "dev", interface, "up"],
         [iw, "dev", interface, "set", "channel", str(channel)],
     ]
+
+
+def linux_cleanup_commands(interface: str) -> list[list[str]]:
+    """Commands to restore a Linux interface to managed mode."""
+    ip = shutil.which("ip")
+    iw = shutil.which("iw")
+    if not ip or not iw:
+        return []
+    
+    # Check if interface is in monitor mode first
+    try:
+        info = subprocess.run([iw, "dev", interface, "info"], 
+                            capture_output=True, text=True, timeout=5)
+        if "type monitor" in info.stdout:
+            return [
+                [ip, "link", "set", "dev", interface, "down"],
+                [iw, "dev", interface, "set", "type", "managed"],
+                [ip, "link", "set", "dev", interface, "up"],
+            ]
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        pass
+    return []
 
 
 class CaptureWorker(threading.Thread):
@@ -170,6 +228,7 @@ class CaptureWorker(threading.Thread):
         self.capture_filter = capture_filter
         self.configure_linux = sys.platform.startswith("linux")
         self.stop_event = threading.Event()
+        self.linux_cleaned = False
 
     def run(self) -> None:
         try:
@@ -180,7 +239,12 @@ class CaptureWorker(threading.Thread):
             return
 
         if sys.platform.startswith("linux") and self.configure_linux:
-            self._configure_linux_monitor()
+            try:
+                self._configure_linux_monitor()
+            except (PermissionError, RuntimeError, FileNotFoundError) as exc:
+                self.output.put(("error", str(exc)))
+                self.output.put(("stopped", None))
+                return
 
         def received(packet: object) -> None:
             try:
@@ -206,12 +270,14 @@ class CaptureWorker(threading.Thread):
         except Exception as exc:
             self.output.put(("error", f"Capture stopped: {exc}"))
         finally:
+            self._cleanup_linux_monitor()
             self.output.put(("stopped", None))
 
     def stop(self) -> None:
         self.stop_event.set()
 
     def _configure_linux_monitor(self) -> None:
+        """Configure Linux interface for monitor mode."""
         for command in linux_monitor_commands(self.interface, 1):
             result = subprocess.run(command, capture_output=True, text=True, timeout=8)
             if result.returncode:
@@ -221,6 +287,29 @@ class CaptureWorker(threading.Thread):
                     f"Linux monitor setup failed ({rendered}): "
                     f"{detail or f'exit status {result.returncode}'}"
                 )
+        
+        # Verify monitor mode is active
+        verify = subprocess.run(
+            [shutil.which("iw"), "dev", self.interface, "info"],
+            capture_output=True, text=True, timeout=5
+        )
+        if "type monitor" not in verify.stdout:
+            raise RuntimeError(f"Interface '{self.interface}' not in monitor mode after setup")
+        
+        self.output.put(("info", f"Interface {self.interface} in monitor mode on channel 1"))
+
+    def _cleanup_linux_monitor(self) -> None:
+        """Restore Linux interface to managed mode."""
+        if self.linux_cleaned or not sys.platform.startswith("linux"):
+            return
+        
+        try:
+            for command in linux_cleanup_commands(self.interface):
+                subprocess.run(command, capture_output=True, timeout=5)
+            self.linux_cleaned = True
+        except Exception:
+            pass  # Best effort cleanup
+
 
 class MacOSCaptureWorker(CaptureWorker):
     """Use Apple's tcpdump to put Wi-Fi into real 802.11 monitor mode."""
@@ -491,9 +580,10 @@ class PictoChatLiveApp:
                                           values=interfaces, state="readonly")
         self.interface_box.pack(fill="x", pady=(8, 12))
         if interfaces:
+            # Prefer wireless interfaces
             preferred = next(
-                (x for x in ("en0", "wlan0", "wlp0s0") if x in interfaces),
-                next((x for x in interfaces if x.startswith(("en", "wl"))), interfaces[0]),
+                (x for x in ("en0", "wlan0", "wlp0s0", "wlx*", "wlo*") if any(x.startswith(prefix) for prefix in ("en", "wl", "wlan")) and x in interfaces),
+                interfaces[0],
             )
             self.interface_var.set(preferred)
 
@@ -679,6 +769,9 @@ class PictoChatLiveApp:
             elif kind == "warning":
                 self.status_var.set(str(payload))
                 self.status_label.configure(fg=WARNING)
+            elif kind == "info":
+                self.status_var.set(str(payload))
+                self.status_label.configure(fg=ACCENT)
             elif kind == "stopped":
                 self.start_button.set_enabled(True)
                 self.stop_button.set_enabled(False)
