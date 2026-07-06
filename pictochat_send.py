@@ -92,8 +92,16 @@ def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
         [iw, "dev", interface, "set", "type", "monitor"],
         [ip, "link", "set", "dev", interface, "up"],
         [iw, "dev", interface, "set", "channel", str(channel)],
-        [iw, "dev", interface, "set", "bitrates", "legacy-2.4", "2"],
     ]
+
+
+def linux_wiphy_name(iw_info: str) -> str:
+    """Extract the phy device name used for per-radio retry configuration."""
+    for line in iw_info.splitlines():
+        fields = line.strip().split()
+        if len(fields) == 2 and fields[0] == "wiphy" and fields[1].isdigit():
+            return f"phy{fields[1]}"
+    raise ValueError("iw did not report a wiphy number for the injection interface")
 
 
 class InjectionWorker(threading.Thread):
@@ -141,8 +149,11 @@ class InjectionWorker(threading.Thread):
 
         try:
             from scapy.all import AsyncSniffer, RadioTap, Raw, conf
-            if sys.platform.startswith("linux") and self.configure_linux:
-                self._configure_linux_monitor()
+            if sys.platform.startswith("linux"):
+                if self.configure_linux:
+                    self._configure_linux_monitor()
+                else:
+                    self._configure_linux_injection_constraints()
             sniffer = AsyncSniffer(iface=self.interface, prn=observe, store=False)
             sniffer.start()
             if discovered_host is None:
@@ -272,6 +283,55 @@ class InjectionWorker(threading.Thread):
                     f"Linux monitor setup failed ({rendered}): "
                     f"{detail or f'exit status {result.returncode}'}"
                 )
+        self._configure_linux_injection_constraints()
+
+    def _configure_linux_injection_constraints(self) -> None:
+        """Apply required PHY rate/retry settings to an existing monitor interface."""
+        iw = shutil.which("iw") or "iw"
+        bitrate_command = [
+            iw,
+            "dev",
+            self.interface,
+            "set",
+            "bitrates",
+            "legacy-2.4",
+            "2",
+        ]
+        bitrate = subprocess.run(
+            bitrate_command, capture_output=True, text=True, timeout=8
+        )
+        if bitrate.returncode:
+            detail = (bitrate.stderr or bitrate.stdout).strip()
+            raise RuntimeError(
+                f"Linux bitrate setup failed ({' '.join(bitrate_command)}): "
+                f"{detail or f'exit status {bitrate.returncode}'}"
+            )
+        info_command = [iw, "dev", self.interface, "info"]
+        info = subprocess.run(info_command, capture_output=True, text=True, timeout=8)
+        if info.returncode:
+            detail = (info.stderr or info.stdout).strip()
+            raise RuntimeError(
+                f"Linux wireless setup failed ({' '.join(info_command)}): "
+                f"{detail or f'exit status {info.returncode}'}"
+            )
+        retry_command = [
+            iw,
+            "phy",
+            linux_wiphy_name(info.stdout),
+            "set",
+            "retry",
+            "short",
+            "1",
+            "long",
+            "1",
+        ]
+        retry = subprocess.run(retry_command, capture_output=True, text=True, timeout=8)
+        if retry.returncode:
+            detail = (retry.stderr or retry.stdout).strip()
+            raise RuntimeError(
+                f"Linux retry setup failed ({' '.join(retry_command)}): "
+                f"{detail or f'exit status {retry.returncode}'}"
+            )
 
     def _error_detail(self, exc: Exception, attempt: int, frame_index: int) -> str:
         lines = [

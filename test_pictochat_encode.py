@@ -32,6 +32,7 @@ from pictochat_send import (
     InjectionWorker,
     linux_injection_radiotap,
     linux_monitor_commands,
+    linux_wiphy_name,
 )
 
 
@@ -66,9 +67,11 @@ class EncoderTests(unittest.TestCase):
         with (
             patch.dict("sys.modules", {"scapy": MagicMock(), "scapy.all": fake_scapy}),
             patch("pictochat_send.sys.platform", "linux"),
+            patch.object(worker, "_configure_linux_injection_constraints") as constraints,
         ):
             worker.run()
 
+        constraints.assert_called_once_with()
         scapy_conf.L2socket.assert_called_once_with(iface="wlan0")
         self.assertEqual(radio_tap.call_count, 65)
         radio_tap.assert_called_with(linux_injection_radiotap())
@@ -88,15 +91,6 @@ class EncoderTests(unittest.TestCase):
                 ["/usr/sbin/iw", "dev", "wlan1", "set", "type", "monitor"],
                 ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "up"],
                 ["/usr/sbin/iw", "dev", "wlan1", "set", "channel", "6"],
-                [
-                    "/usr/sbin/iw",
-                    "dev",
-                    "wlan1",
-                    "set",
-                    "bitrates",
-                    "legacy-2.4",
-                    "2",
-                ],
             ],
         )
 
@@ -105,6 +99,16 @@ class EncoderTests(unittest.TestCase):
             linux_injection_radiotap(),
             bytes.fromhex("00 00 0c 00 06 80 00 00 02 04 08 00"),
         )
+
+    def test_linux_wiphy_name_is_extracted_from_iw_info(self):
+        self.assertEqual(
+            linux_wiphy_name("Interface wlan1mon\n\twiphy 3\n\ttype monitor\n"),
+            "phy3",
+        )
+
+    def test_linux_wiphy_name_rejects_missing_phy(self):
+        with self.assertRaisesRegex(ValueError, "wiphy number"):
+            linux_wiphy_name("Interface wlan1mon\n\ttype monitor\n")
 
     def test_linux_monitor_setup_reports_missing_tools(self):
         with patch("pictochat_send.shutil.which", return_value=None):
