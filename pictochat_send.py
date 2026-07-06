@@ -258,9 +258,9 @@ class PictoChatSendApp:
         tk.Label(shell, text="PICTOCHAT", bg=BG, fg=ACCENT,
                  font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
         tk.Label(shell, text="Airwriter", bg=BG, fg=INK,
-                 font=("TkDefaultFont", 28, "bold")).pack(anchor="w")
+                 font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
         tk.Label(shell, text="Compose a DS-sized drawing and prepare it for the air.",
-                 bg=BG, fg=MUTED, font=("TkDefaultFont", 11)).pack(anchor="w", pady=(3, 20))
+                 bg=BG, fg=MUTED, font=("TkDefaultFont", 9)).pack(anchor="w", pady=(3, 20))
 
         body = tk.Frame(shell, bg=BG)
         body.pack(fill="both", expand=True)
