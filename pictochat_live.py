@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import queue
 import shlex
 import socket
@@ -137,6 +138,22 @@ class FlatButton(tk.Label):
         if inside and callable(self.command):
             self.command()
 
+def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
+    """Commands required to prepare a Linux mac80211 interface for injection."""
+    ip = shutil.which("ip")
+    iw = shutil.which("iw")
+    if not ip or not iw:
+        missing = ", ".join(name for name, path in (("ip", ip), ("iw", iw)) if not path)
+        raise FileNotFoundError(
+            f"Linux wireless setup requires {missing}; install the iproute2 and iw packages"
+        )
+    return [
+        [ip, "link", "set", "dev", interface, "down"],
+        [iw, "dev", interface, "set", "type", "monitor"],
+        [ip, "link", "set", "dev", interface, "up"],
+        [iw, "dev", interface, "set", "channel", str(channel)],
+    ]
+
 
 class CaptureWorker(threading.Thread):
     """Run Scapy's blocking sniffer away from Tk's event loop."""
@@ -145,12 +162,13 @@ class CaptureWorker(threading.Thread):
         self,
         output: queue.Queue[tuple[str, object]],
         interface: str,
-        capture_filter: str,
+        capture_filter: str
     ) -> None:
         super().__init__(daemon=True)
         self.output = output
         self.interface = interface
         self.capture_filter = capture_filter
+        self.configure_linux = sys.platform.startswith("linux")
         self.stop_event = threading.Event()
 
     def run(self) -> None:
@@ -160,6 +178,9 @@ class CaptureWorker(threading.Thread):
             self.output.put(("error", "Scapy is not installed. Run: pip install scapy"))
             self.output.put(("stopped", None))
             return
+
+        if sys.platform.startswith("linux") and self.configure_linux:
+            self._configure_linux_monitor()
 
         def received(packet: object) -> None:
             try:
@@ -190,6 +211,16 @@ class CaptureWorker(threading.Thread):
     def stop(self) -> None:
         self.stop_event.set()
 
+    def _configure_linux_monitor(self) -> None:
+        for command in linux_monitor_commands(self.interface, 1):
+            result = subprocess.run(command, capture_output=True, text=True, timeout=8)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                rendered = " ".join(command)
+                raise RuntimeError(
+                    f"Linux monitor setup failed ({rendered}): "
+                    f"{detail or f'exit status {result.returncode}'}"
+                )
 
 class MacOSCaptureWorker(CaptureWorker):
     """Use Apple's tcpdump to put Wi-Fi into real 802.11 monitor mode."""
@@ -406,6 +437,7 @@ class PictoChatLiveApp:
 
         self.interface_var = tk.StringVar()
         self.channel_var = tk.StringVar(value="1")
+        self.configure_linux_var = tk.BooleanVar(value=sys.platform.startswith("linux"))
         self.filter_var = tk.StringVar()
         self.stream_var = tk.StringVar(value="Auto")
         self.status_var = tk.StringVar(value="Ready to listen")
