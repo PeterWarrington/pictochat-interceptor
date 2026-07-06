@@ -19,6 +19,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageTk
 
+from pictochat_ui import UiMetrics
+
 from pictochat_decode import (
     BASE_OFFSET,
     CANVAS_H,
@@ -52,9 +54,6 @@ ERROR = "#ff6b7a"
 # based on the observed wire protocol or every normal cycle looks incomplete.
 EXPECTED_CHUNKS = IMAGE_BUFFER_SIZE // CHUNK_PAYLOAD_LEN
 LAST_CHUNK_OFFSET = BASE_OFFSET + (EXPECTED_CHUNKS - 1) * CHUNK_PAYLOAD_LEN
-PREVIEW_SCALE = 3
-
-
 def resource_path(filename: str) -> Path:
     """Return a project resource path in source and PyInstaller builds."""
     bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -79,16 +78,18 @@ class FlatButton(tk.Label):
         command: object,
         background: str,
         foreground: str,
+        ui: UiMetrics | None = None,
     ) -> None:
+        ui = ui or UiMetrics(144.0, 1.0)
         super().__init__(
             parent,
             text=text,
             bg=background,
             fg=foreground,
-            padx=10,
-            pady=9,
+            padx=ui.px(10),
+            pady=ui.px(9),
             cursor="hand2",
-            font=("TkDefaultFont", 10, "bold"),
+            font=("TkDefaultFont", ui.font(10), "bold"),
         )
         self.command = command
         self.normal_background = background
@@ -452,11 +453,13 @@ class MacOSChannelCaptureWorker(CaptureWorker):
 class PictoChatLiveApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
+        self.ui = UiMetrics.from_root(root)
+        self.preview_scale = self.ui.preview_scale
         self.root.title("PictoChat Interceptor")
         self.app_icon = tk.PhotoImage(file=resource_path("icon.png"))
         self.root.iconphoto(True, self.app_icon)
-        self.root.geometry("1040x800")
-        self.root.minsize(900, 650)
+        self.root.geometry(self.ui.geometry(1040, 800))
+        self.root.minsize(self.ui.px(900), self.ui.px(650))
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -497,40 +500,41 @@ class PictoChatLiveApp:
         style.theme_use("clam")
         style.configure("TCombobox", fieldbackground=PANEL_2, background=PANEL_2,
                         foreground=INK, arrowcolor=INK, bordercolor="#343d4d",
-                        lightcolor="#343d4d", darkcolor="#343d4d", padding=7)
+                        lightcolor="#343d4d", darkcolor="#343d4d", padding=self.ui.px(7))
         style.map("TCombobox", fieldbackground=[("readonly", PANEL_2)],
                   foreground=[("readonly", INK)])
         style.configure("Air.Horizontal.TProgressbar", troughcolor=PANEL_2,
                         background=ACCENT, bordercolor=PANEL_2, lightcolor=ACCENT,
-                        darkcolor=ACCENT, thickness=8)
+                        darkcolor=ACCENT, thickness=self.ui.px(8))
 
     def _build_ui(self) -> None:
-        shell = tk.Frame(self.root, bg=BG, padx=28, pady=24)
+        u = self.ui
+        shell = tk.Frame(self.root, bg=BG, padx=u.px(28), pady=u.px(24))
         shell.pack(fill="both", expand=True)
 
         header = tk.Frame(shell, bg=BG)
-        header.pack(fill="x", pady=(0, 20))
+        header.pack(fill="x", pady=(0, u.px(20)))
         tk.Label(header, text="PICTOCHAT", bg=BG, fg=ACCENT,
-                 font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+                 font=("TkDefaultFont", u.font(10), "bold")).pack(anchor="w")
         tk.Label(header, text="Interceptor", bg=BG, fg=INK,
-                 font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
+                 font=("TkDefaultFont", u.font(12), "bold")).pack(anchor="w")
         tk.Label(header, text="Watch Nintendo DS drawings assemble over the air.",
-                 bg=BG, fg=MUTED, font=("TkDefaultFont", 9)).pack(anchor="w", pady=(3, 0))
+                 bg=BG, fg=MUTED, font=("TkDefaultFont", u.font(9))).pack(anchor="w", pady=(u.px(3), 0))
 
         body = tk.Frame(shell, bg=BG)
         body.pack(fill="both", expand=True)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
 
-        controls = tk.Frame(body, bg=PANEL, padx=18, pady=18, width=275)
-        controls.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+        controls = tk.Frame(body, bg=PANEL, padx=u.px(18), pady=u.px(18), width=u.px(275))
+        controls.grid(row=0, column=0, sticky="nsew", padx=(0, u.px(18)))
         controls.grid_propagate(False)
 
         self._section_label(controls, "CAPTURE SOURCE").pack(anchor="w")
         interfaces = available_interfaces()
         self.interface_box = ttk.Combobox(controls, textvariable=self.interface_var,
                                           values=interfaces, state="readonly")
-        self.interface_box.pack(fill="x", pady=(8, 12))
+        self.interface_box.pack(fill="x", pady=(u.px(8), u.px(12)))
         if interfaces:
             preferred = next(
                 (x for x in ("en0", "wlan0", "wlp*", "wlx*", "wlo*") if any(x.startswith(prefix) for prefix in ("en", "wl", "wlan")) and x in interfaces),
@@ -539,44 +543,44 @@ class PictoChatLiveApp:
             self.interface_var.set(preferred)
 
         tk.Label(controls, text="2.4 GHz channel", bg=PANEL, fg=MUTED,
-                 font=("TkDefaultFont", 9)).pack(anchor="w")
+                 font=("TkDefaultFont", u.font(9))).pack(anchor="w")
         channel_values = [str(channel) for channel in range(1, 14)] + ["Current"]
         self.channel_box = ttk.Combobox(controls, textvariable=self.channel_var,
                                         values=channel_values, state="readonly")
-        self.channel_box.pack(fill="x", pady=(5, 12))
+        self.channel_box.pack(fill="x", pady=(u.px(5), u.px(12)))
 
         filter_label = "Optional BPF filter"
         if sys.platform == "darwin":
             filter_label += " (Current only)"
         tk.Label(controls, text=filter_label, bg=PANEL, fg=MUTED,
-                 font=("TkDefaultFont", 9)).pack(anchor="w")
+                 font=("TkDefaultFont", u.font(9))).pack(anchor="w")
         filter_entry = tk.Entry(controls, textvariable=self.filter_var, bg=PANEL_2,
                                 fg=INK, insertbackground=INK, relief="flat",
                                 highlightthickness=1, highlightbackground="#343d4d",
-                                highlightcolor=ACCENT, font=("TkFixedFont", 10))
-        filter_entry.pack(fill="x", ipady=8, pady=(5, 14))
+                                highlightcolor=ACCENT, font=("TkFixedFont", u.font(10)))
+        filter_entry.pack(fill="x", ipady=u.px(8), pady=(u.px(5), u.px(14)))
 
         self.start_button = self._button(controls, "Start listening", self.start_capture, ACCENT, "#071b17")
-        self.start_button.pack(fill="x", pady=(0, 8))
+        self.start_button.pack(fill="x", pady=(0, u.px(8)))
         self.stop_button = self._button(controls, "Stop", self.stop_capture, PANEL_2, INK)
         self.stop_button.set_enabled(False)
-        self.stop_button.pack(fill="x", pady=(0, 8))
+        self.stop_button.pack(fill="x", pady=(0, u.px(8)))
         self._button(controls, "Open a saved hex dump", self.open_dump, PANEL_2, INK).pack(fill="x")
 
-        tk.Frame(controls, bg="#303746", height=1).pack(fill="x", pady=18)
+        tk.Frame(controls, bg="#303746", height=1).pack(fill="x", pady=u.px(18))
         self._section_label(controls, "DRAWING STREAM").pack(anchor="w")
         self.stream_box = ttk.Combobox(controls, textvariable=self.stream_var,
                                        values=["Auto"], state="readonly")
-        self.stream_box.pack(fill="x", pady=(8, 12))
+        self.stream_box.pack(fill="x", pady=(u.px(8), u.px(12)))
         self.stream_box.bind("<<ComboboxSelected>>", lambda _event: self._render_selected())
-        self._button(controls, "Save drawing as PNG", self.save_image, PANEL_2, INK).pack(fill="x", pady=(0, 8))
+        self._button(controls, "Save drawing as PNG", self.save_image, PANEL_2, INK).pack(fill="x", pady=(0, u.px(8)))
         self._button(controls, "Clear session", self.reset_session, PANEL_2, WARNING).pack(fill="x")
 
         note = ("You MUST have a live PictoChat session between two or more connected DS systems! Only one system does not work :(\n\n"
                 "Tip: the Wi-Fi interface must expose raw 802.11 frames. "
                 "Monitor mode and capture permission are usually required.")
-        tk.Label(controls, text=note, wraplength=235, justify="left", bg=PANEL,
-                 fg=MUTED, font=("TkDefaultFont", 9)).pack(side="bottom", anchor="w")
+        tk.Label(controls, text=note, wraplength=u.px(235), justify="left", bg=PANEL,
+                 fg=MUTED, font=("TkDefaultFont", u.font(9))).pack(side="bottom", anchor="w")
 
         workspace = tk.Frame(body, bg=BG)
         workspace.grid(row=0, column=1, sticky="nsew")
@@ -584,17 +588,17 @@ class PictoChatLiveApp:
         workspace.grid_rowconfigure(1, weight=1)
 
         stats = tk.Frame(workspace, bg=BG)
-        stats.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        stats.grid(row=0, column=0, sticky="ew", pady=(0, u.px(14)))
         for column in range(2):
             stats.grid_columnconfigure(column, weight=1)
         self._stat_card(stats, "PICTOCHAT CHUNKS", self.candidate_var).grid(
-            row=0, column=0, sticky="ew", padx=(0, 7)
+            row=0, column=0, sticky="ew", padx=(0, u.px(7))
         )
         self._stat_card(stats, "STREAMS", self.stream_count_var).grid(
-            row=0, column=1, sticky="ew", padx=(7, 0)
+            row=0, column=1, sticky="ew", padx=(u.px(7), 0)
         )
 
-        viewer = tk.Frame(workspace, bg=PANEL, padx=22, pady=20)
+        viewer = tk.Frame(workspace, bg=PANEL, padx=u.px(22), pady=u.px(20))
         viewer.grid(row=1, column=0, sticky="nsew")
         viewer.grid_columnconfigure(0, weight=1)
         viewer.grid_rowconfigure(1, weight=1)
@@ -602,13 +606,13 @@ class PictoChatLiveApp:
         title_row = tk.Frame(viewer, bg=PANEL)
         title_row.grid(row=0, column=0, sticky="ew")
         tk.Label(title_row, text="Live canvas", bg=PANEL, fg=INK,
-                 font=("TkDefaultFont", 15, "bold")).pack(side="left")
+                 font=("TkDefaultFont", u.font(15), "bold")).pack(side="left")
         self.status_label = tk.Label(title_row, textvariable=self.status_var, bg=PANEL,
-                                     fg=MUTED, font=("TkDefaultFont", 10))
+                                     fg=MUTED, font=("TkDefaultFont", u.font(10)))
         self.status_label.pack(side="right")
 
-        canvas_frame = tk.Frame(viewer, bg="#080a0e", padx=14, pady=14)
-        canvas_frame.grid(row=1, column=0, sticky="nsew", pady=16)
+        canvas_frame = tk.Frame(viewer, bg="#080a0e", padx=u.px(14), pady=u.px(14))
+        canvas_frame.grid(row=1, column=0, sticky="nsew", pady=u.px(16))
         self.preview = tk.Label(canvas_frame, bg="#080a0e", bd=0)
         self.preview.place(relx=.5, rely=.5, anchor="center")
 
@@ -617,31 +621,28 @@ class PictoChatLiveApp:
         ttk.Progressbar(footer, variable=self.progress_var, maximum=100,
                         style="Air.Horizontal.TProgressbar").pack(fill="x")
         tk.Label(footer, textvariable=self.coverage_var, bg=PANEL, fg=MUTED,
-                 font=("TkDefaultFont", 9)).pack(anchor="e", pady=(6, 0))
+                 font=("TkDefaultFont", u.font(9))).pack(anchor="e", pady=(u.px(6), 0))
 
-    @staticmethod
-    def _section_label(parent: tk.Widget, text: str) -> tk.Label:
+    def _section_label(self, parent: tk.Widget, text: str) -> tk.Label:
         return tk.Label(parent, text=text, bg=PANEL, fg=MUTED,
-                        font=("TkDefaultFont", 9, "bold"))
+                        font=("TkDefaultFont", self.ui.font(9), "bold"))
 
-    @staticmethod
-    def _button(parent: tk.Widget, text: str, command: object,
+    def _button(self, parent: tk.Widget, text: str, command: object,
                 background: str, foreground: str) -> FlatButton:
-        return FlatButton(parent, text, command, background, foreground)
+        return FlatButton(parent, text, command, background, foreground, self.ui)
 
-    @staticmethod
-    def _stat_card(parent: tk.Widget, title: str, variable: tk.StringVar) -> tk.Frame:
-        card = tk.Frame(parent, bg=PANEL, padx=15, pady=12)
+    def _stat_card(self, parent: tk.Widget, title: str, variable: tk.StringVar) -> tk.Frame:
+        card = tk.Frame(parent, bg=PANEL, padx=self.ui.px(15), pady=self.ui.px(12))
         tk.Label(card, text=title, bg=PANEL, fg=MUTED,
-                 font=("TkDefaultFont", 8, "bold")).pack(anchor="w")
+                 font=("TkDefaultFont", self.ui.font(8), "bold")).pack(anchor="w")
         tk.Label(card, textvariable=variable, bg=PANEL, fg=INK,
-                 font=("TkDefaultFont", 18, "bold")).pack(anchor="w", pady=(3, 0))
+                 font=("TkDefaultFont", self.ui.font(18), "bold")).pack(anchor="w", pady=(self.ui.px(3), 0))
         return card
 
     def _show_empty_preview(self) -> None:
-        image = Image.new("RGB", (CANVAS_W * PREVIEW_SCALE, CANVAS_H * PREVIEW_SCALE), "#f5f3ed")
+        image = Image.new("RGB", (CANVAS_W * self.preview_scale, CANVAS_H * self.preview_scale), "#f5f3ed")
         draw = ImageDraw.Draw(image)
-        step = 8 * PREVIEW_SCALE
+        step = 8 * self.preview_scale
         for x in range(0, image.width, step):
             draw.line((x, 0, x, image.height), fill="#e8e5dd")
         for y in range(0, image.height, step):
@@ -833,7 +834,7 @@ class PictoChatLiveApp:
         indices = compose_canvas_row_major(decode_4bpp_tiles(buffer))
         self.current_image = canvas_to_image(indices)
         display = self.current_image.resize(
-            (CANVAS_W * PREVIEW_SCALE, CANVAS_H * PREVIEW_SCALE), Image.Resampling.NEAREST
+            (CANVAS_W * self.preview_scale, CANVAS_H * self.preview_scale), Image.Resampling.NEAREST
         ).convert("RGB")
         self.preview_photo = ImageTk.PhotoImage(display)
         self.preview.configure(image=self.preview_photo)
