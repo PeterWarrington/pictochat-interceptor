@@ -157,11 +157,9 @@ def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
         raise RuntimeError(f"Network interface '{interface}' does not exist")
     
     # Check if we have permission to modify the interface
-    # Try a simple operation first to check permissions
     try:
         subprocess.run([ip, "link", "set", "dev", interface, "down"], 
                       capture_output=True, check=True)
-        # Bring it back up if it was up before
         subprocess.run([ip, "link", "set", "dev", interface, "up"], 
                       capture_output=True, check=True)
     except subprocess.CalledProcessError as e:
@@ -177,12 +175,10 @@ def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
         info = subprocess.run([iw, "dev", interface, "info"], 
                             capture_output=True, text=True, check=True)
         if "type monitor" in info.stdout:
-            # Already in monitor mode, just set channel
             return [[iw, "dev", interface, "set", "channel", str(channel)]]
     except subprocess.CalledProcessError:
-        pass  # Continue with normal setup
+        pass
     
-    # Standard monitor mode setup
     return [
         [ip, "link", "set", "dev", interface, "down"],
         [iw, "dev", interface, "set", "type", "monitor"],
@@ -198,7 +194,6 @@ def linux_cleanup_commands(interface: str) -> list[list[str]]:
     if not ip or not iw:
         return []
     
-    # Check if interface is in monitor mode first
     try:
         info = subprocess.run([iw, "dev", interface, "info"], 
                             capture_output=True, text=True, timeout=5)
@@ -214,7 +209,7 @@ def linux_cleanup_commands(interface: str) -> list[list[str]]:
 
 
 class CaptureWorker(threading.Thread):
-    """Run Scapy's blocking sniffer away from Tk's event loop."""
+    """Run tcpdump packet capture away from Tk's event loop, streamed into Scapy."""
 
     def __init__(
         self,
@@ -229,10 +224,11 @@ class CaptureWorker(threading.Thread):
         self.configure_linux = sys.platform.startswith("linux")
         self.stop_event = threading.Event()
         self.linux_cleaned = False
+        self.process: subprocess.Popen[bytes] | None = None
 
     def run(self) -> None:
         try:
-            from scapy.all import sniff
+            from scapy.utils import PcapReader
         except ImportError:
             self.output.put(("error", "Scapy is not installed. Run: pip install scapy"))
             self.output.put(("stopped", None))
@@ -246,107 +242,22 @@ class CaptureWorker(threading.Thread):
                 self.output.put(("stopped", None))
                 return
 
-        def received(packet: object) -> None:
-            try:
-                self.output.put(("packet", list(bytes(packet))))
-            except Exception as exc:  # a malformed packet should not end capture
-                self.output.put(("warning", f"Skipped one packet: {exc}"))
-
-        try:
-            while not self.stop_event.is_set():
-                kwargs: dict[str, object] = {
-                    "iface": self.interface or None,
-                    "prn": received,
-                    "store": False,
-                    "timeout": 1,
-                }
-                if self.capture_filter.strip():
-                    kwargs["filter"] = self.capture_filter.strip()
-                sniff(**kwargs)
-        except PermissionError:
-            self.output.put(
-                ("error", "Packet capture was denied. Re-run this app with capture privileges.")
-            )
-        except Exception as exc:
-            self.output.put(("error", f"Capture stopped: {exc}"))
-        finally:
-            self._cleanup_linux_monitor()
-            self.output.put(("stopped", None))
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-    def _configure_linux_monitor(self) -> None:
-        """Configure Linux interface for monitor mode."""
-        for command in linux_monitor_commands(self.interface, 1):
-            result = subprocess.run(command, capture_output=True, text=True, timeout=8)
-            if result.returncode:
-                detail = (result.stderr or result.stdout).strip()
-                rendered = " ".join(command)
-                raise RuntimeError(
-                    f"Linux monitor setup failed ({rendered}): "
-                    f"{detail or f'exit status {result.returncode}'}"
-                )
+        tcpdump_path = shutil.which("tcpdump") or "/usr/sbin/tcpdump"
         
-        # Verify monitor mode is active
-        verify = subprocess.run(
-            [shutil.which("iw"), "dev", self.interface, "info"],
-            capture_output=True, text=True, timeout=5
-        )
-        if "type monitor" not in verify.stdout:
-            raise RuntimeError(f"Interface '{self.interface}' not in monitor mode after setup")
-        
-        self.output.put(("info", f"Interface {self.interface} in monitor mode on channel 1"))
-
-    def _cleanup_linux_monitor(self) -> None:
-        """Restore Linux interface to managed mode."""
-        if self.linux_cleaned or not sys.platform.startswith("linux"):
-            return
-        
-        try:
-            for command in linux_cleanup_commands(self.interface):
-                subprocess.run(command, capture_output=True, timeout=5)
-            self.linux_cleaned = True
-        except Exception:
-            pass  # Best effort cleanup
-
-
-class MacOSCaptureWorker(CaptureWorker):
-    """Use Apple's tcpdump to put Wi-Fi into real 802.11 monitor mode."""
-
-    def __init__(
-        self,
-        output: queue.Queue[tuple[str, object]],
-        interface: str,
-        capture_filter: str,
-    ) -> None:
-        super().__init__(output, interface, capture_filter)
-        self.process: subprocess.Popen[bytes] | None = None
-
-    def run(self) -> None:
-        try:
-            from scapy.utils import PcapReader
-        except ImportError:
-            self.output.put(("error", "Scapy is not installed. Run: pip install scapy"))
-            self.output.put(("stopped", None))
-            return
-
         command = [
-            "/usr/sbin/tcpdump",
-            "-I",
-            "-i",
-            self.interface,
-            "-y",
-            "IEEE802_11_RADIO",
-            "-B",
-            "4096",
-            "-s",
-            "0",
+            tcpdump_path,
+            "-i", self.interface,
+            "-B", "4096",
+            "-s", "0",
             "--immediate-mode",
             "-U",
-            "-w",
-            "-",
+            "-w", "-",
         ]
+        
+        if sys.platform == "darwin":
+            command.insert(1, "-I")
+            command.extend(["-y", "IEEE802_11_RADIO"])
+
         try:
             if self.capture_filter.strip():
                 command.extend(shlex.split(self.capture_filter))
@@ -376,28 +287,25 @@ class MacOSCaptureWorker(CaptureWorker):
                 error_text = self.process.stderr.read().decode("utf-8", errors="replace").strip()
             if return_code and not self.stop_event.is_set():
                 if "Operation not permitted" in error_text or "Permission denied" in error_text:
-                    message = (
-                        "Monitor capture was denied. Launch with sudo or grant BPF capture access."
-                    )
+                    message = "Monitor capture was denied. Launch with sudo or grant capture privileges."
                 else:
-                    message = f"macOS monitor capture stopped: {error_text or 'tcpdump failed'}"
+                    message = f"Capture stopped: {error_text or 'tcpdump failed'}"
                 self.output.put(("error", message))
         except FileNotFoundError:
-            self.output.put(("error", "Apple tcpdump was not found at /usr/sbin/tcpdump."))
+            self.output.put(("error", f"tcpdump was not found at {tcpdump_path}."))
         except Exception as exc:
             if not self.stop_event.is_set():
                 detail = str(exc)
                 process = self.process
                 if process is not None and process.poll() is not None and process.stderr is not None:
-                    tcpdump_error = process.stderr.read().decode(
-                        "utf-8", errors="replace"
-                    ).strip()
+                    tcpdump_error = process.stderr.read().decode("utf-8", errors="replace").strip()
                     if tcpdump_error:
                         detail = tcpdump_error
                 if "Operation not permitted" in detail or "Permission denied" in detail:
-                    detail = "Monitor capture was denied. Launch with sudo or grant BPF capture access."
-                self.output.put(("error", f"macOS monitor capture stopped: {detail}"))
+                    detail = "Monitor capture was denied. Launch with sudo or grant capture privileges."
+                self.output.put(("error", f"Capture stopped: {detail}"))
         finally:
+            self._cleanup_linux_monitor()
             process = self.process
             if process is not None and process.poll() is None:
                 process.terminate()
@@ -408,13 +316,46 @@ class MacOSCaptureWorker(CaptureWorker):
             self.output.put(("stopped", None))
 
     def stop(self) -> None:
-        super().stop()
+        self.stop_event.set()
         process = self.process
         if process is not None and process.poll() is None:
             process.terminate()
 
+    def _configure_linux_monitor(self) -> None:
+        """Configure Linux interface for monitor mode."""
+        for command in linux_monitor_commands(self.interface, 1):
+            result = subprocess.run(command, capture_output=True, text=True, timeout=8)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                rendered = " ".join(command)
+                raise RuntimeError(
+                    f"Linux monitor setup failed ({rendered}): "
+                    f"{detail or f'exit status {result.returncode}'}"
+                )
+        
+        verify = subprocess.run(
+            [shutil.which("iw"), "dev", self.interface, "info"],
+            capture_output=True, text=True, timeout=5
+        )
+        if "type monitor" not in verify.stdout:
+            raise RuntimeError(f"Interface '{self.interface}' not in monitor mode after setup")
+        
+        self.output.put(("info", f"Interface {self.interface} in monitor mode on channel 1"))
 
-class MacOSChannelCaptureWorker(MacOSCaptureWorker):
+    def _cleanup_linux_monitor(self) -> None:
+        """Restore Linux interface to managed mode."""
+        if self.linux_cleaned or not sys.platform.startswith("linux"):
+            return
+        
+        try:
+            for command in linux_cleanup_commands(self.interface):
+                subprocess.run(command, capture_output=True, timeout=5)
+            self.linux_cleaned = True
+        except Exception:
+            pass
+
+
+class MacOSChannelCaptureWorker(CaptureWorker):
     """Retune Apple Wi-Fi through CoreWLAN, then start monitor capture."""
 
     def __init__(
@@ -447,8 +388,6 @@ class MacOSChannelCaptureWorker(MacOSCaptureWorker):
         if os.geteuid() == 0:
             return subprocess.run(command, capture_output=True, text=True, timeout=8)
 
-        # Elevate only the tiny helper in /tmp. Keeping the GUI in the user's
-        # session preserves macOS privacy access to Documents and file dialogs.
         shell_command = " ".join(shlex.quote(part) for part in command)
         apple_script = (
             f"do shell script {json.dumps(shell_command)} "
@@ -580,7 +519,6 @@ class PictoChatLiveApp:
                                           values=interfaces, state="readonly")
         self.interface_box.pack(fill="x", pady=(8, 12))
         if interfaces:
-            # Prefer wireless interfaces
             preferred = next(
                 (x for x in ("en0", "wlan0", "wlp*", "wlx*", "wlo*") if any(x.startswith(prefix) for prefix in ("en", "wl", "wlan")) and x in interfaces),
                 interfaces[0],
@@ -725,20 +663,13 @@ class PictoChatLiveApp:
                 self.filter_var.get(),
                 int(self.channel_var.get()),
             )
-        elif sys.platform == "darwin":
-            self.worker = MacOSCaptureWorker(
-                self.events, self.interface_var.get(), self.filter_var.get()
-            )
         else:
             self.worker = CaptureWorker(
                 self.events, self.interface_var.get(), self.filter_var.get()
             )
         self.worker.start()
-        if sys.platform == "darwin":
-            if self.channel_var.get() == "Current":
-                self.status_var.set("Listening on the current Wi-Fi channel…")
-            else:
-                self.status_var.set(f"Retuning Wi-Fi to channel {self.channel_var.get()}…")
+        if sys.platform == "darwin" and self.channel_var.get() != "Current":
+            self.status_var.set(f"Retuning Wi-Fi to channel {self.channel_var.get()}…")
         else:
             self.status_var.set("Listening…")
         self.status_label.configure(fg=ACCENT)
@@ -787,8 +718,6 @@ class PictoChatLiveApp:
     def _ingest_packet(self, packet: list[int]) -> None:
         packet_index = self.packet_count
         self.packet_count += 1
-        # Keep damaged-FCS copies as provisional recovery material. Verified
-        # retransmissions replace them automatically in build_chunk_streams().
         found = extract_chunk_candidates_from_packet(
             packet, packet_index, accept_bad_fcs=True
         )
