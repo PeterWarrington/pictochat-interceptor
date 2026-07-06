@@ -582,7 +582,7 @@ class PictoChatLiveApp:
         if interfaces:
             # Prefer wireless interfaces
             preferred = next(
-                (x for x in ("en0", "wlan0", "wlp0s0", "wlx*", "wlo*") if any(x.startswith(prefix) for prefix in ("en", "wl", "wlan")) and x in interfaces),
+                (x for x in ("en0", "wlan0", "wlp*", "wlx*", "wlo*") if any(x.startswith(prefix) for prefix in ("en", "wl", "wlan")) and x in interfaces),
                 interfaces[0],
             )
             self.interface_var.set(preferred)
