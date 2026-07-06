@@ -2,6 +2,8 @@
 
 <img src="icon.png" width="100px"/>
 
+[Download for MacOS (ARM)](https://github.com/PeterWarrington/pictochat-interceptor/releases/download/v0.1/PictoChat-Interceptor-v0.1-ARM64-macOS.zip)
+
 Decode Nintendo DS PictoChat drawings from saved wireless hex dumps or watch them
 assemble during a live capture.
 
