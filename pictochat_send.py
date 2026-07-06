@@ -7,6 +7,7 @@ import queue
 import random
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -67,6 +68,16 @@ RADIOTAP_SHORT_PREAMBLE = 0x02
 RADIOTAP_TX_NOACK = 0x0008
 
 
+def linux_injection_radiotap() -> bytes:
+    """Return a byte-exact radiotap request for Nintendo client frames."""
+    present = (1 << 1) | (1 << 2) | (1 << 15)  # Flags, Rate, TXFlags
+    return (
+        struct.pack("<BBHI", 0, 0, 12, present)
+        + bytes((RADIOTAP_SHORT_PREAMBLE, NINTENDO_RATE_MBPS * 2))
+        + struct.pack("<H", RADIOTAP_TX_NOACK)
+    )
+
+
 def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
     """Commands required to prepare a Linux mac80211 interface for injection."""
     ip = shutil.which("ip")
@@ -81,6 +92,7 @@ def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
         [iw, "dev", interface, "set", "type", "monitor"],
         [ip, "link", "set", "dev", interface, "up"],
         [iw, "dev", interface, "set", "channel", str(channel)],
+        [iw, "dev", interface, "set", "bitrates", "legacy-2.4", "2"],
     ]
 
 
@@ -162,15 +174,10 @@ class InjectionWorker(threading.Thread):
             # a short preamble for every client upload.  PictoChat confirms
             # uploads with host relay frames rather than conventional control
             # ACKs, so also suppress mac80211's multi-second retry cycle.
-            # Radiotap Rate is expressed in Mbps by Scapy and serialized in
-            # 500 kbps units.
+            # The Linux setup also constrains hardware rate control because
+            # many adapters ignore per-packet legacy Rate requests.
             def injection_packet(frame: bytes) -> object:
-                return RadioTap(
-                    present="Flags+Rate+TXFlags",
-                    Flags=RADIOTAP_SHORT_PREAMBLE,
-                    Rate=NINTENDO_RATE_MBPS,
-                    TXFlags=RADIOTAP_TX_NOACK,
-                ) / Raw(frame)
+                return RadioTap(linux_injection_radiotap()) / Raw(frame)
 
             transfer_packet = injection_packet(transfer_header)
             chunk_packets = [injection_packet(frame) for frame in chunk_frames]

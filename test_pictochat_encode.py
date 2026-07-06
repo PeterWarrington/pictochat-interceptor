@@ -29,10 +29,8 @@ from pictochat_encode import (
 )
 from pictochat_live import EXPECTED_CHUNKS, LAST_CHUNK_OFFSET
 from pictochat_send import (
-    NINTENDO_RATE_MBPS,
-    RADIOTAP_SHORT_PREAMBLE,
-    RADIOTAP_TX_NOACK,
     InjectionWorker,
+    linux_injection_radiotap,
     linux_monitor_commands,
 )
 
@@ -73,12 +71,7 @@ class EncoderTests(unittest.TestCase):
 
         scapy_conf.L2socket.assert_called_once_with(iface="wlan0")
         self.assertEqual(radio_tap.call_count, 65)
-        radio_tap.assert_called_with(
-            present="Flags+Rate+TXFlags",
-            Flags=RADIOTAP_SHORT_PREAMBLE,
-            Rate=NINTENDO_RATE_MBPS,
-            TXFlags=RADIOTAP_TX_NOACK,
-        )
+        radio_tap.assert_called_with(linux_injection_radiotap())
         self.assertEqual(radio_socket.send.call_count, 65)
         radio_socket.close.assert_called_once()
         async_sniffer.return_value.start.assert_called_once()
@@ -95,7 +88,22 @@ class EncoderTests(unittest.TestCase):
                 ["/usr/sbin/iw", "dev", "wlan1", "set", "type", "monitor"],
                 ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "up"],
                 ["/usr/sbin/iw", "dev", "wlan1", "set", "channel", "6"],
+                [
+                    "/usr/sbin/iw",
+                    "dev",
+                    "wlan1",
+                    "set",
+                    "bitrates",
+                    "legacy-2.4",
+                    "2",
+                ],
             ],
+        )
+
+    def test_linux_injection_radiotap_is_byte_exact(self):
+        self.assertEqual(
+            linux_injection_radiotap(),
+            bytes.fromhex("00 00 0c 00 06 80 00 00 02 04 08 00"),
         )
 
     def test_linux_monitor_setup_reports_missing_tools(self):
