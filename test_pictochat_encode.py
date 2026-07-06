@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -22,9 +23,29 @@ from pictochat_encode import (
     write_pcap,
 )
 from pictochat_live import EXPECTED_CHUNKS, LAST_CHUNK_OFFSET
+from pictochat_send import linux_monitor_commands
 
 
 class EncoderTests(unittest.TestCase):
+    def test_linux_monitor_setup_uses_argument_lists(self):
+        paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw"}
+        with patch("pictochat_send.shutil.which", side_effect=paths.get):
+            commands = linux_monitor_commands("wlan1", 6)
+        self.assertEqual(
+            commands,
+            [
+                ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "down"],
+                ["/usr/sbin/iw", "dev", "wlan1", "set", "type", "monitor"],
+                ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "up"],
+                ["/usr/sbin/iw", "dev", "wlan1", "set", "channel", "6"],
+            ],
+        )
+
+    def test_linux_monitor_setup_reports_missing_tools(self):
+        with patch("pictochat_send.shutil.which", return_value=None):
+            with self.assertRaisesRegex(FileNotFoundError, "iproute2 and iw"):
+                linux_monitor_commands("wlan0", 1)
+
     def test_live_nintendo_wire_format_remains_64_chunks(self):
         # Real DS/DSi captures stop at 0x2800. The encoder's optional 65th tail
         # chunk is useful for lossless local round-trips, but must not redefine

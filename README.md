@@ -18,8 +18,8 @@ You MUST have a live PictoChat session between two or more connected DS systems!
 ## Experimental sender GUI
 
 `pictochat_send.py` is the cross-platform companion to the live viewer. It has a
-DS-sized drawing surface, image import, PNG export, packet-capture export, and an
-experimental raw 802.11 sender:
+DS-sized drawing surface with black and DSi rainbow-colour pens, image import,
+PNG export, packet-capture export, and an experimental raw 802.11 sender:
 
 ```sh
 .venv/bin/python pictochat_send.py
@@ -38,6 +38,31 @@ Mac users will generally need a compatible external adapter (often passed to a
 Linux VM). PictoChat's surrounding NiFi session is request/relay driven; the raw
 sender reproduces the observed image frames, but joining and coordinating a
 real room remains experimental rather than guaranteed.
+
+Airwriter writes each frame directly through Scapy's layer-2 socket so a BPF or
+driver rejection identifies the exact pass and frame. Detailed errors, errno,
+traceback, and the macOS interface state are printed to stderr and shown in a
+copyable diagnostic window. A successful write only means the kernel accepted
+the bytes; macOS firmware can still discard unsupported injection silently.
+
+### Linux radio setup
+
+Install Tkinter and the standard wireless tools (package names shown for
+Debian/Ubuntu), then launch Airwriter with the privileges needed for monitor
+mode and raw sockets:
+
+```sh
+sudo apt install python3-tk iw iproute2
+sudo .venv/bin/python pictochat_send.py
+```
+
+Select the USB Wi-Fi interface (usually `wlan0` or `wlan1`), choose the
+PictoChat channel, and leave **Configure monitor mode automatically** enabled.
+Airwriter runs `ip`/`iw` without a shell to bring that adapter down, switch it
+to monitor mode, bring it up, and tune it. It intentionally leaves the adapter
+in monitor mode afterward. Disable automatic setup if you already created a
+monitor interface such as `wlan0mon`. NetworkManager may need to be told to
+ignore a dedicated capture adapter if it continually changes the interface.
 
 ## Live viewer
 
