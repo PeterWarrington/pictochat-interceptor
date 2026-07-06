@@ -228,7 +228,19 @@ class CaptureWorker(threading.Thread):
 
     def run(self) -> None:
         try:
+            # Force Scapy to load wireless layers explicitly
+            import scapy.layers.dot11
             from scapy.utils import PcapReader
+            from scapy.config import conf
+            
+            # Link-type 127 is IEEE802_11_RADIO. Force Scapy to map it to RadioTap 
+            # if it's struggling to recognize it natively on Linux.
+            try:
+                from scapy.layers.dot11 import RadioTap
+                conf.l2.register_lltype(127, RadioTap)
+            except Exception:
+                pass
+                
         except ImportError:
             self.output.put(("error", "Scapy is not installed. Run: pip install scapy"))
             self.output.put(("stopped", None))
@@ -244,6 +256,7 @@ class CaptureWorker(threading.Thread):
 
         tcpdump_path = shutil.which("tcpdump") or "/usr/sbin/tcpdump"
         
+        # Consistent flags across both platforms
         command = [
             tcpdump_path,
             "-i", self.interface,
@@ -252,11 +265,11 @@ class CaptureWorker(threading.Thread):
             "--immediate-mode",
             "-U",
             "-w", "-",
+            "-y", "IEEE802_11_RADIO" # Force tcpdump on Linux to output the exact same linktype format
         ]
         
         if sys.platform == "darwin":
             command.insert(1, "-I")
-            command.extend(["-y", "IEEE802_11_RADIO"])
 
         try:
             if self.capture_filter.strip():
@@ -332,7 +345,7 @@ class CaptureWorker(threading.Thread):
                     f"Linux monitor setup failed ({rendered}): "
                     f"{detail or f'exit status {result.returncode}'}"
                 )
-        
+
         verify = subprocess.run(
             [shutil.which("iw"), "dev", self.interface, "info"],
             capture_output=True, text=True, timeout=5
