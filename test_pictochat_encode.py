@@ -30,7 +30,11 @@ from pictochat_encode import (
 from pictochat_live import EXPECTED_CHUNKS, LAST_CHUNK_OFFSET
 from pictochat_send import (
     InjectionWorker,
+    is_linux_network_manager_command,
+    linux_cleanup_commands,
     linux_injection_radiotap,
+    linux_iw_channel,
+    linux_monitor_interface_commands,
     linux_monitor_commands,
     linux_wiphy_name,
 )
@@ -165,16 +169,78 @@ class EncoderTests(unittest.TestCase):
         async_sniffer.return_value.stop.assert_called_once()
 
     def test_linux_monitor_setup_uses_argument_lists(self):
-        paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw"}
+        paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw", "nmcli": "/usr/bin/nmcli"}
         with patch("pictochat_send.shutil.which", side_effect=paths.get):
             commands = linux_monitor_commands("wlan1", 6)
         self.assertEqual(
             commands,
             [
+                ["/usr/bin/nmcli", "device", "set", "wlan1", "managed", "no"],
                 ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "down"],
                 ["/usr/sbin/iw", "dev", "wlan1", "set", "type", "monitor"],
+                ["/usr/sbin/iw", "dev", "wlan1", "set", "monitor", "control", "otherbss"],
                 ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "up"],
                 ["/usr/sbin/iw", "dev", "wlan1", "set", "channel", "6"],
+            ],
+        )
+
+    def test_linux_monitor_setup_does_not_require_network_manager(self):
+        paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw"}
+        with patch("pictochat_send.shutil.which", side_effect=paths.get):
+            commands = linux_monitor_commands("wlan1", 6)
+        self.assertEqual(commands[0], ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "down"])
+
+    def test_linux_auto_setup_creates_dedicated_monitor_interface(self):
+        paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw", "nmcli": "/usr/bin/nmcli"}
+        with (
+            patch("pictochat_send.shutil.which", side_effect=paths.get),
+            patch("pictochat_send.linux_interface_exists", return_value=False),
+        ):
+            monitor_interface, commands = linux_monitor_interface_commands("wlan1", 6)
+        self.assertEqual(monitor_interface, "wlan1mon")
+        self.assertIn(
+            [
+                "/usr/sbin/iw",
+                "dev",
+                "wlan1",
+                "interface",
+                "add",
+                "wlan1mon",
+                "type",
+                "monitor",
+            ],
+            commands,
+        )
+        self.assertEqual(commands[-1], ["/usr/sbin/iw", "dev", "wlan1mon", "set", "channel", "6"])
+
+    def test_linux_network_manager_command_is_optional(self):
+        self.assertTrue(
+            is_linux_network_manager_command(
+                ["/usr/bin/nmcli", "device", "set", "wlan1", "managed", "no"]
+            )
+        )
+        self.assertFalse(
+            is_linux_network_manager_command(
+                ["/usr/sbin/iw", "dev", "wlan1", "set", "type", "monitor"]
+            )
+        )
+
+    def test_linux_cleanup_restores_monitor_interface(self):
+        paths = {"ip": "/usr/sbin/ip", "iw": "/usr/sbin/iw", "nmcli": "/usr/bin/nmcli"}
+        iw_info = MagicMock(returncode=0, stdout="Interface wlan1\n\ttype monitor\n")
+        with (
+            patch("pictochat_send.shutil.which", side_effect=paths.get),
+            patch("pictochat_send.subprocess.run", return_value=iw_info),
+        ):
+            commands = linux_cleanup_commands("wlan1")
+        self.assertEqual(
+            commands,
+            [
+                ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "down"],
+                ["/usr/sbin/iw", "dev", "wlan1", "set", "type", "managed"],
+                ["/usr/sbin/ip", "link", "set", "dev", "wlan1", "up"],
+                ["/usr/bin/nmcli", "device", "set", "wlan1", "managed", "yes"],
+                ["/usr/bin/nmcli", "device", "connect", "wlan1"],
             ],
         )
 
@@ -193,6 +259,12 @@ class EncoderTests(unittest.TestCase):
     def test_linux_wiphy_name_rejects_missing_phy(self):
         with self.assertRaisesRegex(ValueError, "wiphy number"):
             linux_wiphy_name("Interface wlan1mon\n\ttype monitor\n")
+
+    def test_linux_iw_channel_is_extracted_from_iw_info(self):
+        self.assertEqual(
+            linux_iw_channel("Interface wlan1mon\n\tchannel 1 (2412 MHz), width: 20 MHz\n"),
+            1,
+        )
 
     def test_linux_driver_constraint_failures_are_nonfatal(self):
         events = Queue()
@@ -314,6 +386,23 @@ class EncoderTests(unittest.TestCase):
         packet = add_radiotap_and_fcs(relay)
         self.assertEqual(find_pictochat_host(packet), host)
         self.assertEqual(extract_host_relay(packet, host), (chunk.offset, chunk.payload))
+
+    def test_observed_host_relay_envelope_is_accepted(self):
+        host = parse_mac("a4:c0:e1:19:b8:79")
+        payload = bytes((index * 3) & 0xFF for index in range(160))
+        frame = (
+            bytes.fromhex("28 02 e0 04")
+            + bytes.fromhex("03 09 bf 00 00 00")
+            + host
+            + host
+            + bytes.fromhex("80 e3")
+            + bytes.fromhex("e6 03 02 00 56 9e 02 00 ac 00 00 97 a0 00")
+            + bytes.fromhex("e0 01 00 00")
+            + payload
+            + bytes.fromhex("10 05 02 00")
+        )
+        self.assertEqual(find_pictochat_host(frame), host)
+        self.assertEqual(extract_host_relay(frame, host), (0x01E0, payload))
 
     def test_image_import_and_pcap_export(self):
         source = Image.new("RGB", (20, 20), "black")

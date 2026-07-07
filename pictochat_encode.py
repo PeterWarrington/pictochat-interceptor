@@ -28,7 +28,9 @@ from pictochat_decode import (
 MESSAGE_PREFIX = b"\x00\x00\x00\x00"
 PICTOCHAT_GROUP = bytes.fromhex("03 09 bf 00 00 00")
 PICTOCHAT_CLIENT_GROUP = bytes.fromhex("03 09 bf 00 00 10")
-HOST_RELAY_PREFIX = bytes.fromhex("e6 03 02 00 56 1e 02 00 ac 00 01 04 a0 00")
+# Host drawing relays observed from a successful room use command 0x97 with
+# byte 29's high bit toggled during the host retry phase.
+HOST_RELAY_PREFIX = bytes.fromhex("e6 03 02 00 56 1e 02 00 ac 00 00 97 a0 00")
 CLIENT_UPLOAD_PREFIX = bytes.fromhex("56 8e 02 00 ac 00 01 04 a0 00")
 CLIENT_TRANSFER_PREFIX = bytes.fromhex("56 8e 02 00 ac 00 01 97 a0 00")
 RADIOTAP_F_FCS = 0x10

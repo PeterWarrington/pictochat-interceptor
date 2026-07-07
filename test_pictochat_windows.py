@@ -27,6 +27,26 @@ class WindowsCompatibilityTests(unittest.TestCase):
         ):
             self.assertEqual(available_interfaces(), ["Wi-Fi"])
 
+    def test_linux_interfaces_come_from_iw_and_do_not_include_loopback(self):
+        iw_output = "\n".join(
+            [
+                "phy#0",
+                "\tInterface wlan1",
+                "\t\tifindex 4",
+                "\t\ttype managed",
+            ]
+        )
+        with (
+            patch("pictochat_live.sys.platform", "linux"),
+            patch("pictochat_live.shutil.which", return_value="/usr/sbin/iw"),
+            patch(
+                "pictochat_live.subprocess.run",
+                return_value=MagicMock(stdout=iw_output),
+            ),
+            patch("pictochat_live.socket.if_nameindex", return_value=[(1, "lo")]),
+        ):
+            self.assertEqual(available_interfaces(), ["wlan1"])
+
     def test_windows_capture_uses_npcap_monitor_socket(self):
         events = Queue()
         worker = CaptureWorker(events, "Wi-Fi", "wlan type data")

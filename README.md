@@ -55,7 +55,9 @@ the bytes; macOS firmware can still discard unsupported injection silently.
 
 Install Tkinter and the standard wireless tools (package names shown for
 Debian/Ubuntu), then launch Airwriter with the privileges needed for monitor
-mode and raw sockets:
+mode and raw sockets. `network-manager` is optional; when `nmcli` is already
+present, the app tells NetworkManager to stop managing the selected adapter
+before changing its mode:
 
 ```sh
 sudo apt install python3-tk iw iproute2
@@ -64,11 +66,12 @@ sudo .venv/bin/python pictochat_send.py
 
 Select the USB Wi-Fi interface (usually `wlan0` or `wlan1`), choose the
 PictoChat channel, and leave **Configure monitor mode automatically** enabled.
-Airwriter runs `ip`/`iw` without a shell to bring that adapter down, switch it
-to monitor mode, bring it up, and tune it. It intentionally leaves the adapter
-in monitor mode afterward. Disable automatic setup if you already created a
-monitor interface such as `wlan0mon`. NetworkManager may need to be told to
-ignore a dedicated capture adapter if it continually changes the interface.
+Airwriter runs `nmcli`/`ip`/`iw` without a shell to mark that adapter unmanaged,
+bring it down, create a dedicated monitor interface such as `wlan0mon`, bring
+that monitor interface up, and tune it. When sending finishes or fails, it
+deletes the monitor interface, brings the original adapter up, and hands it back
+to NetworkManager when `nmcli` is available. Disable automatic setup if you
+already created a monitor interface such as `wlan0mon`.
 
 ## Live viewer
 
@@ -132,6 +135,12 @@ interface must receive raw frames in the same radiotap/802.11 layout as the save
 captures. The macOS tcpdump route listens on the adapter's monitor channel; if
 the Nintendo DS is using another channel, no PictoChat chunks will appear.
 Linux typically requires monitor mode plus root or packet-capture capabilities.
+When `nmcli` is available, the viewer also marks the selected adapter unmanaged
+while capture is running so NetworkManager does not retune it. Auto-setup
+captures through a dedicated monitor interface such as `wlan0mon`, then deletes
+that monitor interface and restores the original adapter when capture stops. The
+**802.11 frames** counter should increase even before PictoChat chunks are
+decoded; if it stays at zero, the adapter is not hearing traffic on that channel.
 
 ## Command-line decoder
 

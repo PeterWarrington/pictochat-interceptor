@@ -75,8 +75,27 @@ def available_interfaces() -> list[str]:
         # Falling back keeps saved-dump viewing usable without Npcap.
         except Exception:
             pass
+    if sys.platform.startswith("linux"):
+        iw = shutil.which("iw")
+        if iw:
+            try:
+                result = subprocess.run(
+                    [iw, "dev"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                interfaces = [
+                    line.strip().split()[1]
+                    for line in result.stdout.splitlines()
+                    if line.strip().startswith("Interface ")
+                ]
+                if interfaces:
+                    return interfaces
+            except (OSError, subprocess.SubprocessError, IndexError):
+                pass
     try:
-        return [name for _, name in socket.if_nameindex()]
+        return [name for _, name in socket.if_nameindex() if name != "lo"]
     except OSError:
         return []
 
@@ -154,72 +173,141 @@ class FlatButton(tk.Label):
 
 
 def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
-    """Commands required to prepare a Linux mac80211 interface for injection."""
+    """Commands required to prepare a Linux mac80211 interface for capture."""
     ip = shutil.which("ip")
     iw = shutil.which("iw")
+    nmcli = shutil.which("nmcli")
     if not ip or not iw:
         missing = ", ".join(name for name, path in (("ip", ip), ("iw", iw)) if not path)
         raise FileNotFoundError(
             f"Linux wireless setup requires {missing}; install the iproute2 and iw packages"
         )
-    
-    # Check if interface exists
-    check_cmd = [ip, "link", "show", "dev", interface]
-    try:
-        subprocess.run(check_cmd, capture_output=True, check=True)
-    except subprocess.CalledProcessError:
-        raise RuntimeError(f"Network interface '{interface}' does not exist")
-    
-    # Check if we have permission to modify the interface
-    try:
-        subprocess.run([ip, "link", "set", "dev", interface, "down"], 
-                      capture_output=True, check=True)
-        subprocess.run([ip, "link", "set", "dev", interface, "up"], 
-                      capture_output=True, check=True)
-    except subprocess.CalledProcessError as e:
-        if "Operation not permitted" in str(e.stderr):
-            raise PermissionError(
-                f"Permission denied to modify interface '{interface}'. "
-                "Run with sudo or adjust permissions."
-            )
-        raise
-    
+
+    commands: list[list[str]] = []
+    if nmcli:
+        commands.append([nmcli, "device", "set", interface, "managed", "no"])
+
     # Get current interface type
     try:
         info = subprocess.run([iw, "dev", interface, "info"], 
                             capture_output=True, text=True, check=True)
         if "type monitor" in info.stdout:
-            return [[iw, "dev", interface, "set", "channel", str(channel)]]
+            commands.extend([
+                [ip, "link", "set", "dev", interface, "down"],
+                [iw, "dev", interface, "set", "type", "monitor"],
+                [iw, "dev", interface, "set", "monitor", "control", "otherbss"],
+                [ip, "link", "set", "dev", interface, "up"],
+                [iw, "dev", interface, "set", "channel", str(channel)],
+            ])
+            return commands
     except subprocess.CalledProcessError:
         pass
-    
-    return [
+
+    commands.extend([
         [ip, "link", "set", "dev", interface, "down"],
         [iw, "dev", interface, "set", "type", "monitor"],
+        [iw, "dev", interface, "set", "monitor", "control", "otherbss"],
         [ip, "link", "set", "dev", interface, "up"],
         [iw, "dev", interface, "set", "channel", str(channel)],
-    ]
+    ])
+    return commands
 
 
-def linux_cleanup_commands(interface: str) -> list[list[str]]:
+def linux_monitor_interface(interface: str) -> str:
+    """Return the Linux interface that should carry monitor traffic."""
+    return interface if interface.endswith("mon") else f"{interface}mon"
+
+
+def linux_interface_exists(interface: str) -> bool:
+    try:
+        return any(name == interface for _, name in socket.if_nameindex())
+    except OSError:
+        return False
+
+
+def linux_monitor_interface_commands(interface: str, channel: int) -> tuple[str, list[list[str]]]:
+    """Commands for a dedicated Linux monitor interface and its capture name."""
+    monitor_interface = linux_monitor_interface(interface)
+    if monitor_interface == interface:
+        return interface, linux_monitor_commands(interface, channel)
+
+    ip = shutil.which("ip")
+    iw = shutil.which("iw")
+    nmcli = shutil.which("nmcli")
+    if not ip or not iw:
+        missing = ", ".join(name for name, path in (("ip", ip), ("iw", iw)) if not path)
+        raise FileNotFoundError(
+            f"Linux wireless setup requires {missing}; install the iproute2 and iw packages"
+        )
+
+    commands: list[list[str]] = []
+    if nmcli:
+        commands.append([nmcli, "device", "set", interface, "managed", "no"])
+    commands.append([ip, "link", "set", "dev", interface, "down"])
+    if not linux_interface_exists(monitor_interface):
+        commands.append([iw, "dev", interface, "interface", "add", monitor_interface, "type", "monitor"])
+    else:
+        commands.append([ip, "link", "set", "dev", monitor_interface, "down"])
+        commands.append([iw, "dev", monitor_interface, "set", "type", "monitor"])
+    commands.extend([
+        [iw, "dev", monitor_interface, "set", "monitor", "control", "otherbss"],
+        [ip, "link", "set", "dev", monitor_interface, "up"],
+        [iw, "dev", monitor_interface, "set", "channel", str(channel)],
+    ])
+    return monitor_interface, commands
+
+
+def linux_iw_channel(iw_info: str) -> int:
+    """Extract the current channel from ``iw dev <iface> info`` output."""
+    for line in iw_info.splitlines():
+        fields = line.strip().split()
+        if len(fields) >= 2 and fields[0] == "channel" and fields[1].isdigit():
+            return int(fields[1])
+    raise ValueError("iw did not report the tuned channel")
+
+
+def linux_cleanup_commands(interface: str, monitor_interface: str | None = None) -> list[list[str]]:
     """Commands to restore a Linux interface to managed mode."""
     ip = shutil.which("ip")
     iw = shutil.which("iw")
+    nmcli = shutil.which("nmcli")
     if not ip or not iw:
         return []
-    
+
+    commands: list[list[str]] = []
+    monitor_interface = monitor_interface or interface
+    if monitor_interface != interface:
+        if linux_interface_exists(monitor_interface):
+            commands.extend([
+                [ip, "link", "set", "dev", monitor_interface, "down"],
+                [iw, "dev", monitor_interface, "del"],
+            ])
+        commands.append([ip, "link", "set", "dev", interface, "up"])
+        if nmcli:
+            commands.append([nmcli, "device", "set", interface, "managed", "yes"])
+            commands.append([nmcli, "device", "connect", interface])
+        return commands
+
     try:
         info = subprocess.run([iw, "dev", interface, "info"], 
                             capture_output=True, text=True, timeout=5)
         if "type monitor" in info.stdout:
-            return [
+            commands.extend([
                 [ip, "link", "set", "dev", interface, "down"],
                 [iw, "dev", interface, "set", "type", "managed"],
                 [ip, "link", "set", "dev", interface, "up"],
-            ]
+            ])
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
         pass
-    return []
+    if nmcli:
+        commands.append([nmcli, "device", "set", interface, "managed", "yes"])
+        commands.append([nmcli, "device", "connect", interface])
+    return commands
+
+
+def is_linux_network_manager_command(command: list[str]) -> bool:
+    """Return true for optional NetworkManager handoff commands."""
+    return Path(command[0]).name == "nmcli"
 
 
 class CaptureWorker(threading.Thread):
@@ -229,12 +317,15 @@ class CaptureWorker(threading.Thread):
         self,
         output: queue.Queue[tuple[str, object]],
         interface: str,
-        capture_filter: str
+        capture_filter: str,
+        channel: int = 1,
     ) -> None:
         super().__init__(daemon=True)
         self.output = output
         self.interface = interface
+        self.capture_interface = interface
         self.capture_filter = capture_filter
+        self.channel = channel
         self.configure_linux = sys.platform.startswith("linux")
         self.stop_event = threading.Event()
         self.linux_cleaned = False
@@ -291,7 +382,7 @@ class CaptureWorker(threading.Thread):
         # Consistent flags across both platforms
         command = [
             tcpdump_path,
-            "-i", self.interface,
+            "-i", self.capture_interface,
             "-B", "4096",
             "-s", "0",
             "--immediate-mode",
@@ -350,7 +441,6 @@ class CaptureWorker(threading.Thread):
                     detail = "Monitor capture was denied. Launch with sudo or grant capture privileges."
                 self.output.put(("error", f"Capture stopped: {detail}"))
         finally:
-            self._cleanup_linux_monitor()
             process = self.process
             if process is not None and process.poll() is None:
                 process.terminate()
@@ -358,6 +448,11 @@ class CaptureWorker(threading.Thread):
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            self._cleanup_linux_monitor()
             self.output.put(("stopped", None))
 
     def _run_windows_capture(self) -> None:
@@ -401,24 +496,49 @@ class CaptureWorker(threading.Thread):
 
     def _configure_linux_monitor(self) -> None:
         """Configure Linux interface for monitor mode."""
-        for command in linux_monitor_commands(self.interface, 1):
+        self.capture_interface, commands = linux_monitor_interface_commands(
+            self.interface, self.channel
+        )
+        for command in commands:
             result = subprocess.run(command, capture_output=True, text=True, timeout=8)
             if result.returncode:
                 detail = (result.stderr or result.stdout).strip()
                 rendered = " ".join(command)
+                if is_linux_network_manager_command(command):
+                    self.output.put(
+                        (
+                            "info",
+                            "NetworkManager handoff was skipped; continuing with direct "
+                            f"wireless setup ({detail or f'exit status {result.returncode}'}).",
+                        )
+                    )
+                    continue
                 raise RuntimeError(
                     f"Linux monitor setup failed ({rendered}): "
                     f"{detail or f'exit status {result.returncode}'}"
                 )
 
         verify = subprocess.run(
-            [shutil.which("iw"), "dev", self.interface, "info"],
+            [shutil.which("iw"), "dev", self.capture_interface, "info"],
             capture_output=True, text=True, timeout=5
         )
         if "type monitor" not in verify.stdout:
-            raise RuntimeError(f"Interface '{self.interface}' not in monitor mode after setup")
+            raise RuntimeError(
+                f"Interface '{self.capture_interface}' not in monitor mode after setup"
+            )
+        actual_channel = linux_iw_channel(verify.stdout)
+        if actual_channel != self.channel:
+            raise RuntimeError(
+                f"Linux monitor setup requested channel {self.channel}, "
+                f"but {self.capture_interface} reports channel {actual_channel}"
+            )
         
-        self.output.put(("info", f"Interface {self.interface} in monitor mode on channel 1"))
+        self.output.put(
+            (
+                "info",
+                f"Interface {self.capture_interface} in monitor mode on channel {actual_channel}",
+            )
+        )
 
     def _cleanup_linux_monitor(self) -> None:
         """Restore Linux interface to managed mode."""
@@ -426,7 +546,7 @@ class CaptureWorker(threading.Thread):
             return
         
         try:
-            for command in linux_cleanup_commands(self.interface):
+            for command in linux_cleanup_commands(self.interface, self.capture_interface):
                 subprocess.run(command, capture_output=True, timeout=5)
             self.linux_cleaned = True
         except Exception:
@@ -549,6 +669,7 @@ class PictoChatLiveApp:
         self.filter_var = tk.StringVar()
         self.stream_var = tk.StringVar(value="Auto")
         self.status_var = tk.StringVar(value="Ready to listen")
+        self.frame_var = tk.StringVar(value="0")
         self.candidate_var = tk.StringVar(value="0")
         self.stream_count_var = tk.StringVar(value="0")
         self.progress_var = tk.DoubleVar(value=0)
@@ -659,13 +780,16 @@ class PictoChatLiveApp:
 
         stats = tk.Frame(workspace, bg=BG)
         stats.grid(row=0, column=0, sticky="ew", pady=(0, u.px(14)))
-        for column in range(2):
+        for column in range(3):
             stats.grid_columnconfigure(column, weight=1)
-        self._stat_card(stats, "PICTOCHAT CHUNKS", self.candidate_var).grid(
+        self._stat_card(stats, "802.11 FRAMES", self.frame_var).grid(
             row=0, column=0, sticky="ew", padx=(0, u.px(7))
         )
+        self._stat_card(stats, "PICTOCHAT CHUNKS", self.candidate_var).grid(
+            row=0, column=1, sticky="ew", padx=u.px(7)
+        )
         self._stat_card(stats, "STREAMS", self.stream_count_var).grid(
-            row=0, column=1, sticky="ew", padx=(u.px(7), 0)
+            row=0, column=2, sticky="ew", padx=(u.px(7), 0)
         )
 
         viewer = tk.Frame(workspace, bg=PANEL, padx=u.px(22), pady=u.px(20))
@@ -748,8 +872,9 @@ class PictoChatLiveApp:
                 int(self.channel_var.get()),
             )
         else:
+            channel = int(self.channel_var.get()) if self.channel_var.get().isdigit() else 1
             self.worker = CaptureWorker(
-                self.events, self.interface_var.get(), self.filter_var.get()
+                self.events, self.interface_var.get(), self.filter_var.get(), channel
             )
         self.worker.start()
         if sys.platform == "darwin" and self.channel_var.get() != "Current":
@@ -802,6 +927,7 @@ class PictoChatLiveApp:
     def _ingest_packet(self, packet: list[int]) -> None:
         packet_index = self.packet_count
         self.packet_count += 1
+        self.frame_var.set(f"{self.packet_count:,}")
         found = extract_chunk_candidates_from_packet(
             packet, packet_index, accept_bad_fcs=True
         )
@@ -965,6 +1091,7 @@ class PictoChatLiveApp:
 
     def reset_session(self) -> None:
         self.packet_count = 0
+        self.frame_var.set("0")
         self.candidates.clear()
         self.streams.clear()
         self.current_image = None

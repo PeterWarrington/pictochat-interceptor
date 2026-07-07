@@ -83,17 +83,127 @@ def linux_monitor_commands(interface: str, channel: int) -> list[list[str]]:
     """Commands required to prepare a Linux mac80211 interface for injection."""
     ip = shutil.which("ip")
     iw = shutil.which("iw")
+    nmcli = shutil.which("nmcli")
     if not ip or not iw:
         missing = ", ".join(name for name, path in (("ip", ip), ("iw", iw)) if not path)
         raise FileNotFoundError(
             f"Linux wireless setup requires {missing}; install the iproute2 and iw packages"
         )
-    return [
+
+    commands: list[list[str]] = []
+    if nmcli:
+        commands.append([nmcli, "device", "set", interface, "managed", "no"])
+    commands.extend([
         [ip, "link", "set", "dev", interface, "down"],
         [iw, "dev", interface, "set", "type", "monitor"],
+        [iw, "dev", interface, "set", "monitor", "control", "otherbss"],
         [ip, "link", "set", "dev", interface, "up"],
         [iw, "dev", interface, "set", "channel", str(channel)],
-    ]
+    ])
+    return commands
+
+
+def linux_monitor_interface(interface: str) -> str:
+    """Return the Linux interface that should carry monitor traffic."""
+    return interface if interface.endswith("mon") else f"{interface}mon"
+
+
+def linux_interface_exists(interface: str) -> bool:
+    try:
+        import socket
+
+        return any(name == interface for _, name in socket.if_nameindex())
+    except OSError:
+        return False
+
+
+def linux_monitor_interface_commands(interface: str, channel: int) -> tuple[str, list[list[str]]]:
+    """Commands for a dedicated Linux monitor interface and its injection name."""
+    monitor_interface = linux_monitor_interface(interface)
+    if monitor_interface == interface:
+        return interface, linux_monitor_commands(interface, channel)
+
+    ip = shutil.which("ip")
+    iw = shutil.which("iw")
+    nmcli = shutil.which("nmcli")
+    if not ip or not iw:
+        missing = ", ".join(name for name, path in (("ip", ip), ("iw", iw)) if not path)
+        raise FileNotFoundError(
+            f"Linux wireless setup requires {missing}; install the iproute2 and iw packages"
+        )
+
+    commands: list[list[str]] = []
+    if nmcli:
+        commands.append([nmcli, "device", "set", interface, "managed", "no"])
+    commands.append([ip, "link", "set", "dev", interface, "down"])
+    if not linux_interface_exists(monitor_interface):
+        commands.append([iw, "dev", interface, "interface", "add", monitor_interface, "type", "monitor"])
+    else:
+        commands.append([ip, "link", "set", "dev", monitor_interface, "down"])
+        commands.append([iw, "dev", monitor_interface, "set", "type", "monitor"])
+    commands.extend([
+        [iw, "dev", monitor_interface, "set", "monitor", "control", "otherbss"],
+        [ip, "link", "set", "dev", monitor_interface, "up"],
+        [iw, "dev", monitor_interface, "set", "channel", str(channel)],
+    ])
+    return monitor_interface, commands
+
+
+def linux_iw_channel(iw_info: str) -> int:
+    """Extract the current channel from ``iw dev <iface> info`` output."""
+    for line in iw_info.splitlines():
+        fields = line.strip().split()
+        if len(fields) >= 2 and fields[0] == "channel" and fields[1].isdigit():
+            return int(fields[1])
+    raise ValueError("iw did not report the tuned channel")
+
+
+def linux_cleanup_commands(interface: str, monitor_interface: str | None = None) -> list[list[str]]:
+    """Commands to restore a Linux interface after automatic injection setup."""
+    ip = shutil.which("ip")
+    iw = shutil.which("iw")
+    nmcli = shutil.which("nmcli")
+    if not ip or not iw:
+        return []
+
+    commands: list[list[str]] = []
+    monitor_interface = monitor_interface or interface
+    if monitor_interface != interface:
+        if linux_interface_exists(monitor_interface):
+            commands.extend([
+                [ip, "link", "set", "dev", monitor_interface, "down"],
+                [iw, "dev", monitor_interface, "del"],
+            ])
+        commands.append([ip, "link", "set", "dev", interface, "up"])
+        if nmcli:
+            commands.append([nmcli, "device", "set", interface, "managed", "yes"])
+            commands.append([nmcli, "device", "connect", interface])
+        return commands
+
+    try:
+        info = subprocess.run(
+            [iw, "dev", interface, "info"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if "type monitor" in info.stdout:
+            commands.extend([
+                [ip, "link", "set", "dev", interface, "down"],
+                [iw, "dev", interface, "set", "type", "managed"],
+                [ip, "link", "set", "dev", interface, "up"],
+            ])
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        pass
+    if nmcli:
+        commands.append([nmcli, "device", "set", interface, "managed", "yes"])
+        commands.append([nmcli, "device", "connect", interface])
+    return commands
+
+
+def is_linux_network_manager_command(command: list[str]) -> bool:
+    """Return true for optional NetworkManager handoff commands."""
+    return Path(command[0]).name == "nmcli"
 
 
 def linux_wiphy_name(iw_info: str) -> str:
@@ -109,7 +219,7 @@ class InjectionWorker(threading.Thread):
     def __init__(self, events: queue.Queue[tuple[str, str]], interface: str,
                  frame_builder: Callable[[bytes], list[bytes]], host_mac: bytes | None,
                  attempts: int, interval: float, channel: int = 1,
-                 configure_linux: bool = False, discovery_timeout: float = 3.0) -> None:
+                 configure_linux: bool = False, discovery_timeout: float = 10.0) -> None:
         super().__init__(daemon=True)
         self.events = events
         self.interface = interface
@@ -120,6 +230,7 @@ class InjectionWorker(threading.Thread):
         self.channel = channel
         self.configure_linux = configure_linux
         self.discovery_timeout = discovery_timeout
+        self.radio_interface = interface
 
     def run(self) -> None:
         radio_socket = None
@@ -134,9 +245,11 @@ class InjectionWorker(threading.Thread):
         expected_payloads: dict[int, bytes] = {}
         transmitted_source: bytes | None = None
         driver_retry_seen = threading.Event()
+        driver_retry_frame = "an upload"
+        outcome: tuple[str, str] | None = None
 
         def observe(packet: object) -> None:
-            nonlocal discovered_host
+            nonlocal discovered_host, driver_retry_frame
             raw = bytes(packet)
             frame = dot11_bytes(raw)
             if (
@@ -148,6 +261,11 @@ class InjectionWorker(threading.Thread):
             ):
                 # The submitted frame has Retry clear. Seeing the same upload
                 # with Retry set proves the adapter ignored radiotap NOACK.
+                driver_retry_frame = (
+                    "the transfer header"
+                    if frame[31] == 0x97
+                    else f"chunk at offset 0x{int.from_bytes(frame[34:36], 'little'):04x}"
+                )
                 driver_retry_seen.set()
             found = find_pictochat_host(raw)
             if discovered_host is None and found is not None:
@@ -168,7 +286,8 @@ class InjectionWorker(threading.Thread):
                     self._configure_linux_monitor()
                 else:
                     self._configure_linux_injection_constraints()
-            sniffer = AsyncSniffer(iface=self.interface, prn=observe, store=False)
+                self._reload_scapy_interfaces(conf)
+            sniffer = AsyncSniffer(iface=self.radio_interface, prn=observe, store=False)
             sniffer.start()
             if discovered_host is None:
                 self.events.put(("progress", "Listening for a PictoChat room host…"))
@@ -176,6 +295,7 @@ class InjectionWorker(threading.Thread):
                     raise TimeoutError(
                         "No PictoChat host was heard. Check the channel, or enter the host MAC manually."
                     )
+                self.events.put(("host", discovered_host.hex(":")))
             self.events.put(
                 (
                     "progress",
@@ -219,8 +339,9 @@ class InjectionWorker(threading.Thread):
             # keyword (it is supported by some capture socket backends).  The
             # interface has already been put into monitor mode with iw above,
             # so passing only its name works on Linux as well as macOS/BPF.
-            radio_socket = conf.L2socket(iface=self.interface)
+            radio_socket = conf.L2socket(iface=self.radio_interface)
             for attempt in range(self.attempts):
+                driver_retry_seen.clear()
                 pending = [
                     (index, packet)
                     for index, (frame, packet) in enumerate(zip(chunk_frames, chunk_packets))
@@ -237,11 +358,7 @@ class InjectionWorker(threading.Thread):
                     raise OSError(f"driver accepted only {written} bytes for transfer header")
                 driver_retry_seen.wait(max(0.05, self.interval * 3))
                 if driver_retry_seen.is_set():
-                    raise RuntimeError(
-                        "The Wi-Fi adapter retransmitted an upload despite the NOACK request. "
-                        "Its driver/firmware does not support the injection control PictoChat "
-                        "requires; use a different mac80211 injection adapter."
-                    )
+                    raise self._driver_retry_error(driver_retry_frame)
                 for frame_index, packet in pending:
                     sent_offsets.add(
                         int.from_bytes(chunk_frames[frame_index][34:36], "little")
@@ -251,6 +368,8 @@ class InjectionWorker(threading.Thread):
                         raise OSError(f"driver accepted only {written} bytes")
                     if self.interval:
                         time.sleep(self.interval)
+                    if driver_retry_seen.is_set():
+                        raise self._driver_retry_error(driver_retry_frame)
                 # Host relays arrive shortly after uploads.  Waiting here makes
                 # subsequent attempts selective instead of repeating the whole image.
                 settle_deadline = time.monotonic() + max(0.25, self.interval * 64)
@@ -260,6 +379,8 @@ class InjectionWorker(threading.Thread):
                         break
                     relay_seen.wait(min(0.05, remaining))
                     relay_seen.clear()
+                    if driver_retry_seen.is_set():
+                        raise self._driver_retry_error(driver_retry_frame)
                 self.events.put(
                     (
                         "progress",
@@ -269,17 +390,17 @@ class InjectionWorker(threading.Thread):
                 )
             if len(acknowledged) == 64:
                 message = "Host relayed all 64 drawing chunks"
+            elif len(acknowledged) == 0:
+                raise self._no_relay_error()
             else:
                 message = (
                     f"Host relayed {len(acknowledged)}/64 chunks after {self.attempts} attempts; "
                     "unconfirmed chunks may require another send"
                 )
-            print(f"[PictoChat Airwriter] {message}", flush=True)
-            self.events.put(("done", message))
+            outcome = ("done", message)
         except Exception as exc:
             detail = self._error_detail(exc, attempt, frame_index)
-            print(detail, file=sys.stderr, flush=True)
-            self.events.put(("error", detail))
+            outcome = ("error", detail)
         finally:
             if sniffer is not None:
                 try:
@@ -295,21 +416,105 @@ class InjectionWorker(threading.Thread):
                         file=sys.stderr,
                         flush=True,
                     )
+            if sys.platform.startswith("linux") and self.configure_linux:
+                self._cleanup_linux_monitor()
+            if outcome is not None:
+                kind, message = outcome
+                if kind == "done":
+                    print(f"[PictoChat Airwriter] {message}", flush=True)
+                else:
+                    print(message, file=sys.stderr, flush=True)
+                self.events.put(outcome)
+
+    def _driver_retry_error(self, frame_name: str) -> RuntimeError:
+        return RuntimeError(
+            f"The Wi-Fi adapter retransmitted {frame_name} despite the NOACK request. "
+            "The dump shows these retry-marked copies are not accepted or relayed by "
+            "the room host. Use a different mac80211 injection adapter/driver, or an "
+            "adapter mode that honors radiotap TX_NOACK."
+        )
+
+    def _no_relay_error(self) -> RuntimeError:
+        return RuntimeError(
+            "The room host did not relay any drawing chunks. The supplied dump shows "
+            "the injected frames on-air, but only retry-marked copies of the upload "
+            "and no host relays for those chunk payloads. This points at the "
+            "injection adapter/driver path rather than the image encoder; use an "
+            "adapter mode that honors radiotap TX_NOACK, or a different mac80211 "
+            "adapter known to inject Nintendo-rate 802.11 frames cleanly."
+        )
 
     def _configure_linux_monitor(self) -> None:
         self.events.put(
             ("progress", f"Configuring {self.interface} for monitor mode on channel {self.channel}…")
         )
-        for command in linux_monitor_commands(self.interface, self.channel):
+        self.radio_interface, commands = linux_monitor_interface_commands(
+            self.interface, self.channel
+        )
+        for command in commands:
             result = subprocess.run(command, capture_output=True, text=True, timeout=8)
             if result.returncode:
                 detail = (result.stderr or result.stdout).strip()
                 rendered = " ".join(command)
+                if is_linux_network_manager_command(command):
+                    self.events.put(
+                        (
+                            "progress",
+                            "NetworkManager handoff was skipped; continuing with direct "
+                            f"wireless setup ({detail or f'exit status {result.returncode}'}).",
+                        )
+                    )
+                    continue
                 raise RuntimeError(
                     f"Linux monitor setup failed ({rendered}): "
                     f"{detail or f'exit status {result.returncode}'}"
                 )
+        info_command = [shutil.which("iw") or "iw", "dev", self.radio_interface, "info"]
+        info = subprocess.run(info_command, capture_output=True, text=True, timeout=8)
+        if info.returncode:
+            detail = (info.stderr or info.stdout).strip()
+            raise RuntimeError(
+                "Linux monitor setup could not verify the tuned channel: "
+                f"{detail or f'exit status {info.returncode}'}"
+            )
+        actual_channel = linux_iw_channel(info.stdout)
+        if actual_channel != self.channel:
+            raise RuntimeError(
+                f"Linux monitor setup requested channel {self.channel}, "
+                f"but {self.radio_interface} reports channel {actual_channel}"
+            )
+        self.events.put(
+            (
+                "progress",
+                f"Using {self.radio_interface} in monitor mode on channel {actual_channel}",
+            )
+        )
         self._configure_linux_injection_constraints()
+
+    def _reload_scapy_interfaces(self, conf: object) -> None:
+        """Refresh Scapy's Linux interface cache after creating wlanXmon."""
+        try:
+            conf.ifaces.reload()
+        except Exception as exc:
+            self.events.put(("progress", f"Scapy interface refresh skipped: {exc}"))
+
+    def _cleanup_linux_monitor(self) -> None:
+        self.events.put(("progress", f"Restoring {self.interface} to managed mode…"))
+        for command in linux_cleanup_commands(self.interface, self.radio_interface):
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=8)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.events.put(("progress", f"Linux interface restore skipped: {exc}"))
+                continue
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                self.events.put(
+                    (
+                        "progress",
+                        "Linux interface restore command failed: "
+                        f"{detail or f'exit status {result.returncode}'}",
+                    )
+                )
 
     def _configure_linux_injection_constraints(self) -> None:
         """Try driver-level rate/retry fallbacks for an existing monitor interface.
@@ -428,14 +633,32 @@ class InjectionWorker(threading.Thread):
         elif sys.platform.startswith("linux"):
             diagnostics = (
                 (
-                    "Linux link state",
+                    "Linux base link state",
                     [shutil.which("ip") or "ip", "-details", "link", "show", "dev", self.interface],
                 ),
                 (
-                    "Linux wireless state",
+                    "Linux base wireless state",
                     [shutil.which("iw") or "iw", "dev", self.interface, "info"],
                 ),
             )
+            if self.radio_interface != self.interface:
+                diagnostics += (
+                    (
+                        "Linux monitor link state",
+                        [
+                            shutil.which("ip") or "ip",
+                            "-details",
+                            "link",
+                            "show",
+                            "dev",
+                            self.radio_interface,
+                        ],
+                    ),
+                    (
+                        "Linux monitor wireless state",
+                        [shutil.which("iw") or "iw", "dev", self.radio_interface, "info"],
+                    ),
+                )
             for heading, command in diagnostics:
                 try:
                     result = subprocess.run(command, capture_output=True, text=True, timeout=3)
@@ -609,7 +832,7 @@ class PictoChatSendApp:
 
         if sys.platform.startswith("linux"):
             note = ("Use the MAC of a DS already joined to the room. Linux auto-setup needs "
-                    "CAP_NET_ADMIN/CAP_NET_RAW and leaves the adapter in monitor mode.")
+                    "CAP_NET_ADMIN/CAP_NET_RAW and restores the adapter when sending ends.")
         elif sys.platform == "win32":
             note = ("Use the MAC of a DS already joined to the room. Windows requires Npcap "
                     "and a Wi-Fi adapter/driver with raw 802.11 monitor and injection support.")
@@ -804,6 +1027,10 @@ class PictoChatSendApp:
         try:
             while True:
                 kind, text = self.events.get_nowait()
+                if kind == "host":
+                    self.host_mac_var.set(text)
+                    self.status_var.set(f"Discovered room host {text}")
+                    continue
                 self.status_var.set(text)
                 if kind == "error":
                     self._show_transmission_error(text)
