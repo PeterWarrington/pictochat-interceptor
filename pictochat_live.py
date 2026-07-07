@@ -54,6 +54,22 @@ ERROR = "#ff6b7a"
 # based on the observed wire protocol or every normal cycle looks incomplete.
 EXPECTED_CHUNKS = IMAGE_BUFFER_SIZE // CHUNK_PAYLOAD_LEN
 LAST_CHUNK_OFFSET = BASE_OFFSET + (EXPECTED_CHUNKS - 1) * CHUNK_PAYLOAD_LEN
+
+
+def fitted_preview_scale(
+    available_width: int,
+    available_height: int,
+    max_scale: int,
+) -> int:
+    """Choose the largest integer preview scale that fits the visible viewport."""
+    if available_width <= 1 or available_height <= 1:
+        return max_scale
+    return max(
+        1,
+        min(max_scale, available_width // CANVAS_W, available_height // CANVAS_H),
+    )
+
+
 def resource_path(filename: str) -> Path:
     """Return a project resource path in source and PyInstaller builds."""
     bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -654,6 +670,7 @@ class PictoChatLiveApp:
         self.streams: list[ChunkStream] = []
         self.current_image: Image.Image | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
+        self.rendered_preview_scale: int | None = None
         self.dirty = False
         self.capture_had_error = False
         self.last_candidate_offset: int | None = None
@@ -805,9 +822,10 @@ class PictoChatLiveApp:
                                      fg=MUTED, font=("TkDefaultFont", u.font(10)))
         self.status_label.pack(side="right")
 
-        canvas_frame = tk.Frame(viewer, bg="#080a0e", padx=u.px(14), pady=u.px(14))
-        canvas_frame.grid(row=1, column=0, sticky="nsew", pady=u.px(16))
-        self.preview = tk.Label(canvas_frame, bg="#080a0e", bd=0)
+        self.canvas_frame = tk.Frame(viewer, bg="#080a0e", padx=u.px(14), pady=u.px(14))
+        self.canvas_frame.grid(row=1, column=0, sticky="nsew", pady=u.px(16))
+        self.canvas_frame.bind("<Configure>", self._resize_preview)
+        self.preview = tk.Label(self.canvas_frame, bg="#080a0e", bd=0)
         self.preview.place(relx=.5, rely=.5, anchor="center")
 
         footer = tk.Frame(viewer, bg=PANEL)
@@ -833,10 +851,27 @@ class PictoChatLiveApp:
                  font=("TkDefaultFont", self.ui.font(18), "bold")).pack(anchor="w", pady=(self.ui.px(3), 0))
         return card
 
+    def _preview_display_scale(self) -> int:
+        return fitted_preview_scale(
+            self.canvas_frame.winfo_width(),
+            self.canvas_frame.winfo_height(),
+            self.preview_scale,
+        )
+
+    def _resize_preview(self, _event: tk.Event) -> None:
+        scale = self._preview_display_scale()
+        if scale == self.rendered_preview_scale:
+            return
+        if self.current_image is None:
+            self._show_empty_preview()
+        else:
+            self._render_selected()
+
     def _show_empty_preview(self) -> None:
-        image = Image.new("RGB", (CANVAS_W * self.preview_scale, CANVAS_H * self.preview_scale), "#f5f3ed")
+        scale = self._preview_display_scale()
+        image = Image.new("RGB", (CANVAS_W * scale, CANVAS_H * scale), "#f5f3ed")
         draw = ImageDraw.Draw(image)
-        step = 8 * self.preview_scale
+        step = 8 * scale
         for x in range(0, image.width, step):
             draw.line((x, 0, x, image.height), fill="#e8e5dd")
         for y in range(0, image.height, step):
@@ -844,6 +879,7 @@ class PictoChatLiveApp:
         draw.text((image.width // 2, image.height // 2), "waiting for a drawing…",
                   fill="#8e918f", anchor="mm")
         self.preview_photo = ImageTk.PhotoImage(image)
+        self.rendered_preview_scale = scale
         self.preview.configure(image=self.preview_photo)
 
     def start_capture(self) -> None:
@@ -971,8 +1007,7 @@ class PictoChatLiveApp:
         if len(self.pending_changed_offsets) >= 2:
             return True
         if (
-            self.pending_started_after_pause
-            and self.pending_changed_offsets
+            self.pending_changed_offsets
             and self.pending_changed_offsets != {LAST_CHUNK_OFFSET}
         ):
             return True
@@ -1029,10 +1064,12 @@ class PictoChatLiveApp:
             write_chunk_to_image_buffer(buffer, offset, payload)
         indices = compose_canvas_row_major(decode_4bpp_tiles(buffer))
         self.current_image = canvas_to_image(indices)
+        scale = self._preview_display_scale()
         display = self.current_image.resize(
-            (CANVAS_W * self.preview_scale, CANVAS_H * self.preview_scale), Image.Resampling.NEAREST
+            (CANVAS_W * scale, CANVAS_H * scale), Image.Resampling.NEAREST
         ).convert("RGB")
         self.preview_photo = ImageTk.PhotoImage(display)
+        self.rendered_preview_scale = scale
         self.preview.configure(image=self.preview_photo)
         chunks = len(stream.chunks)
         recovered = chunks - len(stream.valid_offsets)
